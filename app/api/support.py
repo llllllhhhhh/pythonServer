@@ -1,0 +1,185 @@
+from collections import defaultdict
+from datetime import datetime
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.database import SessionLocal, get_db
+from app.core.security import require_admin
+from app.models import SupportConversation, SupportMessage
+from app.schemas.api import SupportSessionPayload
+
+router = APIRouter(prefix="/support", tags=["实时客服"])
+
+
+def message_dict(message: SupportMessage) -> dict:
+    return {
+        "id": message.id, "conversation_id": message.conversation_id,
+        "sender_role": message.sender_role, "sender_name": message.sender_name,
+        "content": message.content, "message_type": message.message_type,
+        "created_at": message.created_at.isoformat() if message.created_at else datetime.now().isoformat(),
+    }
+
+
+def conversation_dict(item: SupportConversation) -> dict:
+    return {
+        "id": item.id, "user_id": item.user_id, "user_name": item.user_name,
+        "status": item.status, "last_message": item.last_message,
+        "unread_admin": item.unread_admin, "unread_user": item.unread_user,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+    }
+
+
+class SupportConnectionManager:
+    def __init__(self):
+        self.connections: dict[str, set[WebSocket]] = defaultdict(set)
+
+    async def connect(self, conversation_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.connections[conversation_id].add(websocket)
+
+    def disconnect(self, conversation_id: str, websocket: WebSocket):
+        self.connections[conversation_id].discard(websocket)
+        if not self.connections[conversation_id]:
+            self.connections.pop(conversation_id, None)
+
+    async def broadcast(self, conversation_id: str, payload: dict):
+        stale = []
+        for socket in self.connections.get(conversation_id, set()).copy():
+            try:
+                await socket.send_json(payload)
+            except Exception:
+                stale.append(socket)
+        for socket in stale:
+            self.disconnect(conversation_id, socket)
+
+
+manager = SupportConnectionManager()
+
+
+@router.post("/conversations")
+async def create_conversation(payload: SupportSessionPayload, db: AsyncSession = Depends(get_db)):
+    item = await db.scalar(
+        select(SupportConversation).where(
+            SupportConversation.user_id == payload.user_id,
+            SupportConversation.status == "open",
+        ).order_by(SupportConversation.updated_at.desc())
+    )
+    if not item:
+        item = SupportConversation(id=str(uuid4()), user_id=payload.user_id, user_name=payload.user_name)
+        db.add(item)
+        await db.commit()
+        await db.refresh(item)
+    return conversation_dict(item)
+
+
+@router.get("/conversations/{conversation_id}/messages")
+async def user_messages(conversation_id: str, user_id: str, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SupportConversation, conversation_id)
+    if not item or item.user_id != user_id:
+        raise HTTPException(status_code=404, detail="客服会话不存在")
+    messages = list(await db.scalars(
+        select(SupportMessage).where(SupportMessage.conversation_id == conversation_id).order_by(SupportMessage.id)
+    ))
+    item.unread_user = 0
+    await db.commit()
+    return [message_dict(message) for message in messages]
+
+
+@router.get("/admin/conversations", dependencies=[Depends(require_admin)])
+async def admin_conversations(db: AsyncSession = Depends(get_db)):
+    items = list(await db.scalars(select(SupportConversation).order_by(SupportConversation.updated_at.desc())))
+    return [conversation_dict(item) for item in items]
+
+
+@router.get("/admin/conversations/{conversation_id}/messages", dependencies=[Depends(require_admin)])
+async def admin_messages(conversation_id: str, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SupportConversation, conversation_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="客服会话不存在")
+    messages = list(await db.scalars(
+        select(SupportMessage).where(SupportMessage.conversation_id == conversation_id).order_by(SupportMessage.id)
+    ))
+    item.unread_admin = 0
+    await db.commit()
+    return [message_dict(message) for message in messages]
+
+
+@router.patch("/admin/conversations/{conversation_id}/close", dependencies=[Depends(require_admin)])
+async def close_conversation(conversation_id: str, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SupportConversation, conversation_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="客服会话不存在")
+    item.status = "closed"
+    await db.commit()
+    # updated_at is generated by MySQL on update. Refresh it while still in
+    # the async session so response serialization never triggers lazy I/O.
+    await db.refresh(item)
+    await manager.broadcast(conversation_id, {"type": "status", "status": "closed"})
+    return conversation_dict(item)
+
+
+@router.websocket("/ws/{conversation_id}")
+async def support_websocket(
+    websocket: WebSocket,
+    conversation_id: str,
+    role: str = Query(default="user"),
+    token: str = Query(default=""),
+    user_id: str = Query(default=""),
+):
+    if role not in {"user", "admin"}:
+        await websocket.close(code=1008)
+        return
+    if role == "admin" and token != settings.admin_api_key:
+        await websocket.close(code=1008)
+        return
+    async with SessionLocal() as db:
+        conversation = await db.get(SupportConversation, conversation_id)
+        if not conversation or (role == "user" and conversation.user_id != user_id):
+            await websocket.close(code=1008)
+            return
+    await manager.connect(conversation_id, websocket)
+    await manager.broadcast(conversation_id, {"type": "presence", "role": role, "online": True})
+    try:
+        while True:
+            data = await websocket.receive_json()
+            event_type = data.get("type", "message")
+            if event_type == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+            if event_type == "typing":
+                await manager.broadcast(conversation_id, {"type": "typing", "role": role, "typing": bool(data.get("typing"))})
+                continue
+            content = str(data.get("content", "")).strip()
+            if event_type != "message" or not content:
+                continue
+            content = content[:2000]
+            async with SessionLocal() as db:
+                conversation = await db.get(SupportConversation, conversation_id)
+                if not conversation or conversation.status != "open":
+                    await websocket.send_json({"type": "error", "message": "当前会话已结束"})
+                    continue
+                sender_name = conversation.user_name if role == "user" else "学徒行客服"
+                message = SupportMessage(
+                    conversation_id=conversation_id, sender_role=role,
+                    sender_name=sender_name, content=content,
+                )
+                db.add(message)
+                conversation.last_message = content[:255]
+                if role == "user":
+                    conversation.unread_admin += 1
+                else:
+                    conversation.unread_user += 1
+                await db.commit()
+                await db.refresh(message)
+                payload = {"type": "message", "message": message_dict(message)}
+            await manager.broadcast(conversation_id, payload)
+    except WebSocketDisconnect:
+        manager.disconnect(conversation_id, websocket)
+        await manager.broadcast(conversation_id, {"type": "presence", "role": role, "online": False})
+    except Exception:
+        manager.disconnect(conversation_id, websocket)
