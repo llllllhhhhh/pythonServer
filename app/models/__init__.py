@@ -1,3 +1,37 @@
-from app.models.entities import DecorationConfig, InviteRelation, PlatformAnnouncement, PointRule, PreferenceEvent, SupportConversation, SupportMessage, TravelOrder, TravelRoute
+from app.models.entities import (
+    DecorationConfig,
+    InviteRelation,
+    PlatformAnnouncement,
+    PointRule,
+    PreferenceEvent,
+    SupportConversation,
+    SupportMessage,
+    TravelOrder,
+    TravelRoute,
+    UserAccount,
+    UserSession,
+    StudyProduct,
+    StudyContent,
+    StudyOrder,
+    UserEntitlement,
+    LearningProfile,
+)
 
-__all__ = ["DecorationConfig", "InviteRelation", "PlatformAnnouncement", "PointRule", "PreferenceEvent", "SupportConversation", "SupportMessage", "TravelOrder", "TravelRoute"]
+__all__ = [
+    "DecorationConfig",
+    "InviteRelation",
+    "PlatformAnnouncement",
+    "PointRule",
+    "PreferenceEvent",
+    "SupportConversation",
+    "SupportMessage",
+    "TravelOrder",
+    "TravelRoute",
+    "UserAccount",
+    "UserSession",
+    "StudyProduct",
+    "StudyContent",
+    "StudyOrder",
+    "UserEntitlement",
+    "LearningProfile",
+]

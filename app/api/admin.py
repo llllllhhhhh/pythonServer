@@ -1,15 +1,29 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.public import PUBLIC_CONFIG_KEY
+from app.core.auth import hash_password
 from app.core.cache import cache_delete
 from app.core.database import get_db
 from app.core.security import require_admin
-from app.models import DecorationConfig, InviteRelation, PlatformAnnouncement, PointRule, PreferenceEvent, TravelOrder, TravelRoute
+from app.models import (
+    DecorationConfig,
+    InviteRelation,
+    PlatformAnnouncement,
+    PointRule,
+    PreferenceEvent,
+    SupportConversation,
+    TravelOrder,
+    TravelRoute,
+    UserAccount,
+    UserSession,
+)
 from app.schemas.api import (
+    AdminUserRow,
+    AdminUsersResponse,
     AnnouncementCreate,
     AnnouncementOut,
     AnnouncementUpdate,
@@ -18,51 +32,64 @@ from app.schemas.api import (
     InviteOut,
     OrderOut,
     OrderReview,
+    PasswordResetPayload,
     PointRuleOut,
     PointRulePayload,
+    RegistrationReviewPayload,
+    RegistrationRow,
     RouteCreate,
     RouteOut,
     RouteUpdate,
+    StatusUpdatePayload,
+    UserSummaryOut,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+
+
+def build_user_row(user: UserAccount, user_conversations: list[SupportConversation]) -> AdminUserRow:
+    return AdminUserRow(
+        id=user.id,
+        user_no=user.user_no,
+        phone=user.phone,
+        nickname=user.nickname,
+        role=user.role,
+        status=user.status,
+        is_registered=user.is_registered,
+        points=user.points,
+        exam_status=user.exam_status,
+        created_at=user.created_at,
+        last_login_at=user.last_login_at,
+        conversation_count=len(user_conversations),
+        open_conversation=any(item.status == "open" for item in user_conversations),
+    )
 
 
 @router.get("/dashboard")
 async def dashboard(db: AsyncSession = Depends(get_db)):
     routes = await db.scalar(select(func.count(TravelRoute.id)))
     pending_orders = await db.scalar(select(func.count(TravelOrder.id)).where(TravelOrder.status == 0))
-    abnormal_invites = await db.scalar(
-        select(func.count(InviteRelation.id)).where(InviteRelation.abnormal.is_(True))
-    )
-    return {"routes": routes or 0, "pending_orders": pending_orders or 0, "abnormal_invites": abnormal_invites or 0}
+    abnormal_invites = await db.scalar(select(func.count(InviteRelation.id)).where(InviteRelation.abnormal.is_(True)))
+    total_users = await db.scalar(select(func.count(UserAccount.id)).where(UserAccount.role == "user"))
+    return {
+        "routes": routes or 0,
+        "pending_orders": pending_orders or 0,
+        "abnormal_invites": abnormal_invites or 0,
+        "users": total_users or 0,
+    }
 
 
 @router.get("/decoration/draft", response_model=DecorationResponse)
 async def get_draft(db: AsyncSession = Depends(get_db)):
-    item = await db.scalar(
-        select(DecorationConfig)
-        .where(DecorationConfig.status == "draft")
-        .order_by(DecorationConfig.version.desc())
-    )
+    item = await db.scalar(select(DecorationConfig).where(DecorationConfig.status == "draft").order_by(DecorationConfig.version.desc()))
     if not item:
         return DecorationResponse(status="draft", content={})
-    return DecorationResponse(
-        id=item.id,
-        version=item.version,
-        status=item.status,
-        content=item.content,
-        published_at=item.published_at,
-    )
+    return DecorationResponse(id=item.id, version=item.version, status=item.status, content=item.content, published_at=item.published_at)
 
 
 @router.put("/decoration/draft", response_model=DecorationResponse)
 async def save_draft(payload: DecorationPayload, db: AsyncSession = Depends(get_db)):
-    item = await db.scalar(
-        select(DecorationConfig)
-        .where(DecorationConfig.status == "draft")
-        .order_by(DecorationConfig.version.desc())
-    )
+    item = await db.scalar(select(DecorationConfig).where(DecorationConfig.status == "draft").order_by(DecorationConfig.version.desc()))
     if item:
         item.content = payload.model_dump(mode="json")
         item.version += 1
@@ -137,8 +164,11 @@ async def toggle_route(route_id: int, enabled: bool, db: AsyncSession = Depends(
 async def announcements(db: AsyncSession = Depends(get_db)):
     return list(
         await db.scalars(
-            select(PlatformAnnouncement)
-            .order_by(PlatformAnnouncement.pinned.desc(), PlatformAnnouncement.updated_at.desc(), PlatformAnnouncement.id.desc())
+            select(PlatformAnnouncement).order_by(
+                PlatformAnnouncement.pinned.desc(),
+                PlatformAnnouncement.updated_at.desc(),
+                PlatformAnnouncement.id.desc(),
+            )
         )
     )
 
@@ -255,6 +285,96 @@ async def freeze_invite(invite_id: int, db: AsyncSession = Depends(get_db)):
     return item
 
 
+@router.get("/users", response_model=AdminUsersResponse)
+async def users(registered_only: bool = False, db: AsyncSession = Depends(get_db)):
+    query = select(UserAccount).order_by(UserAccount.created_at.desc())
+    if registered_only:
+        query = query.where(UserAccount.is_registered.is_(True))
+    all_users = list(await db.scalars(query))
+    conversations = list(await db.scalars(select(SupportConversation)))
+    conv_map: dict[str, list[SupportConversation]] = {}
+    for item in conversations:
+        conv_map.setdefault(item.user_id, []).append(item)
+    rows = []
+    for user in all_users:
+        if user.role != "user":
+            continue
+        user_conversations = conv_map.get(user.user_no, [])
+        rows.append(build_user_row(user, user_conversations))
+    admins = await db.scalar(select(func.count(UserAccount.id)).where(UserAccount.role == "admin")) or 0
+    users_count = await db.scalar(select(func.count(UserAccount.id)).where(UserAccount.role == "user")) or 0
+    registered = await db.scalar(
+        select(func.count(UserAccount.id)).where(UserAccount.role == "user", UserAccount.is_registered.is_(True))
+    ) or 0
+    active = await db.scalar(
+        select(func.count(UserAccount.id)).where(UserAccount.role == "user", UserAccount.status == "active")
+    ) or 0
+    pending = await db.scalar(
+        select(func.count(UserAccount.id)).where(UserAccount.role == "user", UserAccount.status == "pending")
+    ) or 0
+    return AdminUsersResponse(
+        summary=UserSummaryOut(
+            total_users=users_count,
+            registered_users=registered,
+            admin_users=admins,
+            active_users=active,
+            pending_users=pending,
+        ),
+        users=rows,
+    )
+
+
+@router.get("/registrations", response_model=list[RegistrationRow])
+async def registrations(db: AsyncSession = Depends(get_db)):
+    query = (
+        select(UserAccount)
+        .where(UserAccount.role == "user", UserAccount.status == "pending")
+        .order_by(UserAccount.created_at.desc())
+    )
+    return list(await db.scalars(query))
+
+
+@router.patch("/registrations/{user_id}/review", response_model=AdminUserRow)
+async def review_registration(user_id: int, payload: RegistrationReviewPayload, db: AsyncSession = Depends(get_db)):
+    user = await db.get(UserAccount, user_id)
+    if not user or user.role != "user":
+        raise HTTPException(status_code=404, detail="用户不存在")
+    user.status = "active" if payload.approved else "rejected"
+    user.is_registered = bool(payload.approved)
+    await db.commit()
+    await db.refresh(user)
+    conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
+    return build_user_row(user, conversations)
+
+
+@router.patch("/users/{user_id}/status", response_model=AdminUserRow)
+async def update_user_status(user_id: int, payload: StatusUpdatePayload, db: AsyncSession = Depends(get_db)):
+    user = await db.get(UserAccount, user_id)
+    if not user or user.role != "user":
+        raise HTTPException(status_code=404, detail="用户不存在")
+    user.status = payload.status
+    user.is_registered = payload.status == "active"
+    if payload.status in {"disabled", "cancelled", "rejected"}:
+        await db.execute(delete(UserSession).where(UserSession.user_id == user.id, UserSession.role == user.role))
+    await db.commit()
+    await db.refresh(user)
+    conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
+    return build_user_row(user, conversations)
+
+
+@router.patch("/users/{user_id}/password", response_model=AdminUserRow)
+async def reset_user_password(user_id: int, payload: PasswordResetPayload, db: AsyncSession = Depends(get_db)):
+    user = await db.get(UserAccount, user_id)
+    if not user or user.role != "user":
+        raise HTTPException(status_code=404, detail="用户不存在")
+    user.password_hash = hash_password(payload.password)
+    await db.execute(delete(UserSession).where(UserSession.user_id == user.id, UserSession.role == user.role))
+    await db.commit()
+    await db.refresh(user)
+    conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
+    return build_user_row(user, conversations)
+
+
 @router.get("/preferences")
 async def preference_insights(db: AsyncSession = Depends(get_db)):
     events = list(await db.scalars(select(PreferenceEvent).order_by(PreferenceEvent.created_at.desc())))
@@ -317,11 +437,7 @@ async def preference_insights(db: AsyncSession = Depends(get_db)):
         )
         rank["score"] += item["score"]
         rank["users"].add(item["user_id"])
-    rankings = sorted(
-        [{**item, "users": len(item["users"])} for item in heat.values()],
-        key=lambda x: x["score"],
-        reverse=True,
-    )
+    rankings = sorted([{**item, "users": len(item["users"])} for item in heat.values()], key=lambda x: x["score"], reverse=True)
     return {
         "summary": {
             "users": len(users),

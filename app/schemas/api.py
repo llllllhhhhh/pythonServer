@@ -24,7 +24,7 @@ class RouteBase(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     category: str = "户外"
     days: str = "3天2夜"
-    price: Decimal = Field(default=0, description="兑换路线所需积分")
+    price: Decimal = Field(default=0, description="所需积分")
     stock: int = 0
     agency: str = ""
     image: str = ""
@@ -133,3 +133,92 @@ class AnnouncementOut(AnnouncementBase):
 class SupportSessionPayload(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
     user_name: str = Field(default="小徒同学", max_length=60)
+
+
+class RegisterPayload(BaseModel):
+    phone: str = Field(min_length=6, max_length=30)
+    password: str = Field(min_length=6, max_length=50)
+    nickname: str = Field(default="小徒同学", max_length=60)
+
+
+class RegisterSubmitResponse(BaseModel):
+    message: str
+    status: str
+
+
+class LoginPayload(BaseModel):
+    account: str = Field(min_length=3, max_length=60)
+    password: str = Field(min_length=6, max_length=50)
+
+
+class UserOut(BaseModel):
+    id: int
+    user_no: str
+    phone: str
+    nickname: str
+    role: str
+    status: str
+    avatar: str = ""
+    points: int = 0
+    exam_status: str = "备考中"
+    is_registered: bool = True
+    last_login_at: datetime | None = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserOut
+
+
+class UserSummaryOut(BaseModel):
+    total_users: int
+    registered_users: int
+    admin_users: int
+    active_users: int
+    pending_users: int = 0
+
+
+class AdminUserRow(BaseModel):
+    id: int
+    user_no: str
+    phone: str
+    nickname: str
+    role: str
+    status: str
+    is_registered: bool
+    points: int
+    exam_status: str
+    created_at: datetime
+    last_login_at: datetime | None = None
+    conversation_count: int = 0
+    open_conversation: bool = False
+
+
+class RegistrationReviewPayload(BaseModel):
+    approved: bool
+
+
+class PasswordResetPayload(BaseModel):
+    password: str = Field(min_length=6, max_length=50)
+
+
+class StatusUpdatePayload(BaseModel):
+    status: str = Field(pattern="^(active|disabled|cancelled|rejected)$")
+
+
+class RegistrationRow(BaseModel):
+    id: int
+    user_no: str
+    phone: str
+    nickname: str
+    status: str
+    exam_status: str
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AdminUsersResponse(BaseModel):
+    summary: UserSummaryOut
+    users: list[AdminUserRow]
