@@ -1,4 +1,7 @@
 from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, func, select
@@ -7,29 +10,42 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.public import PUBLIC_CONFIG_KEY
 from app.core.auth import hash_password
 from app.core.cache import cache_delete
+from app.core.config import settings
 from app.core.database import get_db
+from app.core.identity import resolve_user_identities, resolve_user_identity
 from app.core.security import require_admin
+from app.core.upload_settings import get_upload_setting, save_upload_setting
 from app.models import (
+    ContentArticle,
     DecorationConfig,
+    GraduationCertification,
     InviteRelation,
     PlatformAnnouncement,
     PointRule,
     PreferenceEvent,
+    SchoolSite,
     SupportConversation,
     TravelOrder,
     TravelRoute,
+    UploadedAsset,
     UserAccount,
     UserSession,
+    WalletTransaction,
 )
 from app.schemas.api import (
     AdminUserRow,
+    AdminUserDetail,
     AdminUsersResponse,
     AnnouncementCreate,
     AnnouncementOut,
     AnnouncementUpdate,
+    ArticleCreate,
+    ArticleOut,
+    ArticleUpdate,
     DecorationPayload,
     DecorationResponse,
     InviteOut,
+    GraduationReviewPayload,
     OrderOut,
     OrderReview,
     PasswordResetPayload,
@@ -40,14 +56,28 @@ from app.schemas.api import (
     RouteCreate,
     RouteOut,
     RouteUpdate,
+    MerchantPasswordPayload,
+    SchoolSiteCreate,
+    SchoolSiteOut,
+    SchoolSiteUpdate,
+    SchoolReviewPayload,
     StatusUpdatePayload,
+    UploadedAssetOut,
+    UploadSettingOut,
+    UploadSettingPayload,
     UserSummaryOut,
+    WalletAdjustPayload,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
 
-def build_user_row(user: UserAccount, user_conversations: list[SupportConversation]) -> AdminUserRow:
+def build_user_row(
+    user: UserAccount,
+    user_conversations: list[SupportConversation],
+    graduation: GraduationCertification | None = None,
+    exam_status: str | None = None,
+) -> AdminUserRow:
     return AdminUserRow(
         id=user.id,
         user_no=user.user_no,
@@ -57,11 +87,19 @@ def build_user_row(user: UserAccount, user_conversations: list[SupportConversati
         status=user.status,
         is_registered=user.is_registered,
         points=user.points,
-        exam_status=user.exam_status,
+        balance=Decimal(user.balance or 0),
+        exam_status=exam_status or user.exam_status,
         created_at=user.created_at,
         last_login_at=user.last_login_at,
         conversation_count=len(user_conversations),
         open_conversation=any(item.status == "open" for item in user_conversations),
+        graduation_status=graduation.status if graduation else "not_submitted",
+    )
+
+
+def build_school_out(item: SchoolSite) -> SchoolSiteOut:
+    return SchoolSiteOut.model_validate(item).model_copy(
+        update={"has_merchant_password": bool(item.merchant_password_hash)}
     )
 
 
@@ -121,6 +159,16 @@ async def publish_decoration(payload: DecorationPayload, db: AsyncSession = Depe
         content=item.content,
         published_at=item.published_at,
     )
+
+
+@router.get("/upload/settings", response_model=UploadSettingOut)
+async def upload_settings(db: AsyncSession = Depends(get_db)):
+    return await get_upload_setting(db)
+
+
+@router.put("/upload/settings", response_model=UploadSettingOut)
+async def update_upload_settings(payload: UploadSettingPayload, db: AsyncSession = Depends(get_db)):
+    return await save_upload_setting(db, payload.max_image_mb)
 
 
 @router.get("/routes", response_model=list[RouteOut])
@@ -221,6 +269,214 @@ async def delete_announcement(announcement_id: int, db: AsyncSession = Depends(g
     await db.commit()
 
 
+@router.get("/articles", response_model=list[ArticleOut])
+async def articles(db: AsyncSession = Depends(get_db)):
+    return list(
+        await db.scalars(
+            select(ContentArticle).order_by(
+                ContentArticle.pinned.desc(),
+                ContentArticle.sort_order.asc(),
+                ContentArticle.updated_at.desc(),
+                ContentArticle.id.desc(),
+            )
+        )
+    )
+
+
+async def ensure_article_slug_available(db: AsyncSession, slug: str, article_id: int | None = None):
+    query = select(ContentArticle).where(ContentArticle.slug == slug)
+    if article_id:
+        query = query.where(ContentArticle.id != article_id)
+    exists = await db.scalar(query)
+    if exists:
+        raise HTTPException(status_code=400, detail="Article slug already exists")
+
+
+@router.post("/articles", response_model=ArticleOut, status_code=status.HTTP_201_CREATED)
+async def create_article(payload: ArticleCreate, db: AsyncSession = Depends(get_db)):
+    data = payload.model_dump()
+    await ensure_article_slug_available(db, data["slug"])
+    if data["status"] and not data["published_at"]:
+        data["published_at"] = datetime.now()
+    item = ContentArticle(**data)
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.put("/articles/{article_id}", response_model=ArticleOut)
+async def update_article(article_id: int, payload: ArticleUpdate, db: AsyncSession = Depends(get_db)):
+    item = await db.get(ContentArticle, article_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Article not found")
+    data = payload.model_dump()
+    await ensure_article_slug_available(db, data["slug"], article_id)
+    for key, value in data.items():
+        setattr(item, key, value)
+    if item.status and not item.published_at:
+        item.published_at = datetime.now()
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/articles/{article_id}/status", response_model=ArticleOut)
+async def toggle_article(article_id: int, enabled: bool, db: AsyncSession = Depends(get_db)):
+    item = await db.get(ContentArticle, article_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Article not found")
+    item.status = enabled
+    if enabled and not item.published_at:
+        item.published_at = datetime.now()
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.delete("/articles/{article_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_article(article_id: int, db: AsyncSession = Depends(get_db)):
+    item = await db.get(ContentArticle, article_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Article not found")
+    await db.delete(item)
+    await db.commit()
+
+
+@router.get("/schools", response_model=list[SchoolSiteOut])
+async def school_sites(db: AsyncSession = Depends(get_db)):
+    rows = list(
+        await db.scalars(
+            select(SchoolSite).order_by(
+                SchoolSite.review_status.asc(),
+                SchoolSite.sort_order.asc(),
+                SchoolSite.id.desc(),
+            )
+        )
+    )
+    return [build_school_out(item) for item in rows]
+
+
+@router.post("/schools", response_model=SchoolSiteOut, status_code=status.HTTP_201_CREATED)
+async def create_school_site(payload: SchoolSiteCreate, db: AsyncSession = Depends(get_db)):
+    data = payload.model_dump()
+    merchant_password = data.pop("merchant_password", "")
+    data["current"] = False
+    data["status"] = data.get("review_status") == "approved" and data.get("status", True)
+    if data.get("merchant_account"):
+        duplicated = await db.scalar(select(SchoolSite).where(SchoolSite.merchant_account == data["merchant_account"]))
+        if duplicated:
+            raise HTTPException(status_code=400, detail="该商户登录账号已被使用")
+    if merchant_password:
+        data["merchant_password_hash"] = hash_password(merchant_password)
+    item = SchoolSite(**data)
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+    return build_school_out(item)
+
+
+@router.put("/schools/{school_id}", response_model=SchoolSiteOut)
+async def update_school_site(school_id: int, payload: SchoolSiteUpdate, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SchoolSite, school_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="School site not found")
+    data = payload.model_dump()
+    data["current"] = False
+    if data.get("review_status") != "approved":
+        data["status"] = False
+    if data.get("merchant_account"):
+        duplicated = await db.scalar(
+            select(SchoolSite).where(
+                SchoolSite.merchant_account == data["merchant_account"],
+                SchoolSite.id != school_id,
+            )
+        )
+        if duplicated:
+            raise HTTPException(status_code=400, detail="该商户登录账号已被其他学校使用")
+    for key, value in data.items():
+        setattr(item, key, value)
+    await db.commit()
+    await db.refresh(item)
+    return build_school_out(item)
+
+
+@router.patch("/schools/{school_id}/status", response_model=SchoolSiteOut)
+async def toggle_school_site(school_id: int, enabled: bool, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SchoolSite, school_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="School site not found")
+    if enabled and item.review_status != "approved":
+        raise HTTPException(status_code=400, detail="学校未审核通过，不能上架展示")
+    item.status = enabled
+    await db.commit()
+    await db.refresh(item)
+    return build_school_out(item)
+
+
+@router.patch("/schools/{school_id}/current", response_model=SchoolSiteOut)
+async def set_current_school_site(school_id: int, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SchoolSite, school_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="School site not found")
+    existing = list(await db.scalars(select(SchoolSite).where(SchoolSite.current.is_(True), SchoolSite.id != school_id)))
+    for other in existing:
+        other.current = False
+    item.current = True
+    item.status = True
+    await db.commit()
+    await db.refresh(item)
+    return build_school_out(item)
+
+
+@router.patch("/schools/{school_id}/review", response_model=SchoolSiteOut)
+async def review_school_site(school_id: int, payload: SchoolReviewPayload, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SchoolSite, school_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="School site not found")
+    item.review_status = "approved" if payload.approved else "rejected"
+    item.reject_reason = "" if payload.approved else payload.reject_reason
+    item.status = bool(payload.approved)
+    if not payload.approved:
+        item.current = False
+    await db.commit()
+    await db.refresh(item)
+    return build_school_out(item)
+
+
+@router.patch("/schools/{school_id}/merchant-password", response_model=SchoolSiteOut)
+async def update_school_merchant_password(
+    school_id: int,
+    payload: MerchantPasswordPayload,
+    db: AsyncSession = Depends(get_db),
+):
+    item = await db.get(SchoolSite, school_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="School site not found")
+    duplicated = await db.scalar(
+        select(SchoolSite).where(
+            SchoolSite.merchant_account == payload.merchant_account,
+            SchoolSite.id != school_id,
+        )
+    )
+    if duplicated:
+        raise HTTPException(status_code=400, detail="该商户登录账号已被其他学校使用")
+    item.merchant_account = payload.merchant_account
+    item.merchant_password_hash = hash_password(payload.merchant_password)
+    await db.commit()
+    await db.refresh(item)
+    return build_school_out(item)
+
+
+@router.delete("/schools/{school_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_school_site(school_id: int, db: AsyncSession = Depends(get_db)):
+    item = await db.get(SchoolSite, school_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="School site not found")
+    await db.delete(item)
+    await db.commit()
+
+
 @router.get("/points/rule", response_model=PointRuleOut)
 async def get_point_rule(db: AsyncSession = Depends(get_db)):
     rule = await db.get(PointRule, 1)
@@ -291,7 +547,10 @@ async def users(registered_only: bool = False, db: AsyncSession = Depends(get_db
     if registered_only:
         query = query.where(UserAccount.is_registered.is_(True))
     all_users = list(await db.scalars(query))
+    identity_map = await resolve_user_identities(db, [user.id for user in all_users if user.role == "user"])
     conversations = list(await db.scalars(select(SupportConversation)))
+    graduation_items = list(await db.scalars(select(GraduationCertification)))
+    graduation_map = {item.user_id: item for item in graduation_items}
     conv_map: dict[str, list[SupportConversation]] = {}
     for item in conversations:
         conv_map.setdefault(item.user_id, []).append(item)
@@ -300,7 +559,7 @@ async def users(registered_only: bool = False, db: AsyncSession = Depends(get_db
         if user.role != "user":
             continue
         user_conversations = conv_map.get(user.user_no, [])
-        rows.append(build_user_row(user, user_conversations))
+        rows.append(build_user_row(user, user_conversations, graduation_map.get(user.id), identity_map.get(user.id, "学员")))
     admins = await db.scalar(select(func.count(UserAccount.id)).where(UserAccount.role == "admin")) or 0
     users_count = await db.scalar(select(func.count(UserAccount.id)).where(UserAccount.role == "user")) or 0
     registered = await db.scalar(
@@ -324,6 +583,56 @@ async def users(registered_only: bool = False, db: AsyncSession = Depends(get_db
     )
 
 
+@router.get("/users/{user_id}", response_model=AdminUserDetail)
+async def user_detail(user_id: int, db: AsyncSession = Depends(get_db)):
+    user = await db.get(UserAccount, user_id)
+    if not user or user.role != "user":
+        raise HTTPException(status_code=404, detail="用户不存在")
+    conversations = list(
+        await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no))
+    )
+    graduation = await db.scalar(
+        select(GraduationCertification).where(GraduationCertification.user_id == user.id)
+    )
+    identity = await resolve_user_identity(db, user.id)
+    return AdminUserDetail(
+        user=build_user_row(user, conversations, graduation, identity),
+        graduation_certification=graduation,
+    )
+
+
+@router.patch("/users/{user_id}/graduation/review", response_model=AdminUserDetail)
+async def review_graduation_certification(
+    user_id: int,
+    payload: GraduationReviewPayload,
+    admin: UserAccount | None = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.get(UserAccount, user_id)
+    if not user or user.role != "user":
+        raise HTTPException(status_code=404, detail="用户不存在")
+    graduation = await db.scalar(
+        select(GraduationCertification).where(GraduationCertification.user_id == user.id)
+    )
+    if not graduation:
+        raise HTTPException(status_code=404, detail="该用户尚未提交录取通知书认证")
+    if not payload.approved and not payload.reject_reason.strip():
+        raise HTTPException(status_code=400, detail="驳回时请填写原因")
+    graduation.status = "approved" if payload.approved else "rejected"
+    graduation.reject_reason = "" if payload.approved else payload.reject_reason.strip()
+    graduation.reviewed_by = admin.id if admin else None
+    graduation.reviewed_at = datetime.now()
+    await db.commit()
+    await db.refresh(graduation)
+    conversations = list(
+        await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no))
+    )
+    return AdminUserDetail(
+        user=build_user_row(user, conversations, graduation, await resolve_user_identity(db, user.id)),
+        graduation_certification=graduation,
+    )
+
+
 @router.get("/registrations", response_model=list[RegistrationRow])
 async def registrations(db: AsyncSession = Depends(get_db)):
     query = (
@@ -341,10 +650,31 @@ async def review_registration(user_id: int, payload: RegistrationReviewPayload, 
         raise HTTPException(status_code=404, detail="用户不存在")
     user.status = "active" if payload.approved else "rejected"
     user.is_registered = bool(payload.approved)
+    if payload.approved:
+        relation = await db.scalar(
+            select(InviteRelation).where(
+                InviteRelation.invitee_phone == user.phone,
+                InviteRelation.score_granted.is_(False),
+                InviteRelation.abnormal.is_(False),
+                InviteRelation.frozen.is_(False),
+            )
+        )
+        rule = await db.get(PointRule, 1)
+        if relation and (not rule or rule.enabled):
+            inviter = await db.scalar(
+                select(UserAccount).where(
+                    UserAccount.user_no == relation.inviter_id,
+                    UserAccount.role == "user",
+                    UserAccount.status == "active",
+                )
+            )
+            if inviter:
+                inviter.points += rule.invite_score if rule else 1
+                relation.score_granted = True
     await db.commit()
     await db.refresh(user)
     conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
-    return build_user_row(user, conversations)
+    return build_user_row(user, conversations, exam_status=await resolve_user_identity(db, user.id))
 
 
 @router.patch("/users/{user_id}/status", response_model=AdminUserRow)
@@ -359,7 +689,7 @@ async def update_user_status(user_id: int, payload: StatusUpdatePayload, db: Asy
     await db.commit()
     await db.refresh(user)
     conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
-    return build_user_row(user, conversations)
+    return build_user_row(user, conversations, exam_status=await resolve_user_identity(db, user.id))
 
 
 @router.patch("/users/{user_id}/password", response_model=AdminUserRow)
@@ -372,7 +702,39 @@ async def reset_user_password(user_id: int, payload: PasswordResetPayload, db: A
     await db.commit()
     await db.refresh(user)
     conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
-    return build_user_row(user, conversations)
+    return build_user_row(user, conversations, exam_status=await resolve_user_identity(db, user.id))
+
+
+@router.post("/users/{user_id}/wallet/adjust", response_model=AdminUserRow)
+async def adjust_user_wallet(user_id: int, payload: WalletAdjustPayload, db: AsyncSession = Depends(get_db)):
+    user = await db.scalar(select(UserAccount).where(UserAccount.id == user_id, UserAccount.role == "user").with_for_update())
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    amount = Decimal(payload.amount).quantize(Decimal("0.01"))
+    before = Decimal(user.balance or 0).quantize(Decimal("0.01"))
+    after = before + amount if payload.direction == "income" else before - amount
+    if after < 0:
+        raise HTTPException(status_code=400, detail="余额不足，不能扣减")
+    user.balance = after
+    db.add(
+        WalletTransaction(
+            user_id=user.id,
+            user_no=user.user_no,
+            transaction_no=f"WA{datetime.now():%Y%m%d%H%M%S}{uuid4().hex[:8].upper()}",
+            direction=payload.direction,
+            amount=amount,
+            balance_before=before,
+            balance_after=after,
+            biz_type="admin_adjust",
+            biz_id=user.id,
+            biz_no=user.user_no,
+            remark=payload.remark or ("后台充值" if payload.direction == "income" else "后台扣减"),
+        )
+    )
+    await db.commit()
+    await db.refresh(user)
+    conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
+    return build_user_row(user, conversations, exam_status=await resolve_user_identity(db, user.id))
 
 
 @router.get("/preferences")
@@ -448,3 +810,58 @@ async def preference_insights(db: AsyncSession = Depends(get_db)):
         "rankings": rankings,
         "users": sorted(user_rows, key=lambda x: x["interest_score"], reverse=True),
     }
+
+
+@router.get("/assets/images", response_model=list[UploadedAssetOut])
+async def image_assets(
+    source: str | None = None,
+    storage: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    await backfill_local_image_assets(db)
+    query = select(UploadedAsset).order_by(UploadedAsset.id.desc())
+    if source:
+        query = query.where(UploadedAsset.source == source)
+    if storage:
+        query = query.where(UploadedAsset.storage == storage)
+    return list(await db.scalars(query))
+
+
+async def backfill_local_image_assets(db: AsyncSession) -> None:
+    upload_root = Path(settings.upload_dir)
+    if not upload_root.exists():
+        return
+    known = set(await db.scalars(select(UploadedAsset.object_key).where(UploadedAsset.storage == "local")))
+    image_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    added = False
+    for file in upload_root.rglob("*"):
+        if not file.is_file() or file.suffix.lower() not in image_suffixes:
+            continue
+        object_key = file.relative_to(upload_root).as_posix()
+        if object_key in known:
+            continue
+        source = "admission_notice" if object_key.startswith("graduation/") else "support" if object_key.startswith("support/") else "common"
+        db.add(
+            UploadedAsset(
+                source=source,
+                storage="local",
+                bucket="",
+                object_key=object_key,
+                path=f"/uploads/{object_key}",
+                url=f"/uploads/{object_key}",
+                filename=file.name,
+                original_name=file.name,
+                mime_type={
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".png": "image/png",
+                    ".gif": "image/gif",
+                    ".webp": "image/webp",
+                }.get(file.suffix.lower(), "image/*"),
+                size=file.stat().st_size,
+                uploader_role="system",
+            )
+        )
+        added = True
+    if added:
+        await db.commit()

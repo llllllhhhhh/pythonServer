@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, Numeric, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -24,7 +24,8 @@ class UserAccount(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     avatar: Mapped[str] = mapped_column(Text, default="")
     points: Mapped[int] = mapped_column(Integer, default=0)
-    exam_status: Mapped[str] = mapped_column(String(20), default="备考中")
+    balance: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    exam_status: Mapped[str] = mapped_column(String(20), default="学员")
     is_registered: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -38,6 +39,27 @@ class UserSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class WalletTransaction(Base, TimestampMixin):
+    __tablename__ = "wallet_transactions"
+    __table_args__ = (
+        Index("ix_wallet_transactions_user_created", "user_id", "created_at"),
+        Index("ix_wallet_transactions_biz", "biz_type", "biz_no"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_no: Mapped[str] = mapped_column(String(64), index=True)
+    transaction_no: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    direction: Mapped[str] = mapped_column(String(20), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    balance_before: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    balance_after: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    biz_type: Mapped[str] = mapped_column(String(30), default="", index=True)
+    biz_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    biz_no: Mapped[str] = mapped_column(String(80), default="", index=True)
+    remark: Mapped[str] = mapped_column(String(255), default="")
 
 
 class DecorationConfig(Base, TimestampMixin):
@@ -133,6 +155,51 @@ class PlatformAnnouncement(Base, TimestampMixin):
     end_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class ContentArticle(Base, TimestampMixin):
+    __tablename__ = "content_articles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(160), index=True)
+    slug: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    summary: Mapped[str] = mapped_column(String(255), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    category: Mapped[str] = mapped_column(String(40), default="协议规则", index=True)
+    cover: Mapped[str] = mapped_column(Text, default="")
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    status: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class SchoolSite(Base, TimestampMixin):
+    __tablename__ = "school_sites"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), index=True)
+    short_name: Mapped[str] = mapped_column(String(80), default="")
+    city: Mapped[str] = mapped_column(String(60), default="")
+    district: Mapped[str] = mapped_column(String(60), default="")
+    logo: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    current: Mapped[bool] = mapped_column("is_current", Boolean, default=False, index=True)
+    review_status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    reject_reason: Mapped[str] = mapped_column(String(255), default="")
+    merchant_account: Mapped[str] = mapped_column(String(60), default="", index=True)
+    merchant_password_hash: Mapped[str] = mapped_column(String(255), default="")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+
+
+class SchoolMerchantSession(Base):
+    __tablename__ = "school_merchant_sessions"
+
+    token: Mapped[str] = mapped_column(String(128), primary_key=True)
+    school_id: Mapped[int] = mapped_column(Integer, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class SupportConversation(Base, TimestampMixin):
     __tablename__ = "support_conversations"
 
@@ -143,10 +210,20 @@ class SupportConversation(Base, TimestampMixin):
     last_message: Mapped[str] = mapped_column(String(255), default="")
     unread_admin: Mapped[int] = mapped_column(Integer, default=0)
     unread_user: Mapped[int] = mapped_column(Integer, default=0)
+    unread_merchant: Mapped[int] = mapped_column(Integer, default=0)
+    conversation_type: Mapped[str] = mapped_column(String(30), default="platform", index=True)
+    order_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    order_no: Mapped[str] = mapped_column(String(40), default="", index=True)
+    product_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    product_name: Mapped[str] = mapped_column(String(160), default="")
+    school_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    school_name: Mapped[str] = mapped_column(String(160), default="")
     user_online: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     admin_online: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    merchant_online: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     last_user_online_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_admin_online_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_merchant_online_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class SupportMessage(Base):
@@ -159,6 +236,7 @@ class SupportMessage(Base):
     content: Mapped[str] = mapped_column(Text, default="")
     message_type: Mapped[str] = mapped_column(String(20), default="text")
     image_url: Mapped[str] = mapped_column(Text, default="")
+    image_thumb_url: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
 
 
@@ -166,6 +244,7 @@ class StudyProduct(Base, TimestampMixin):
     __tablename__ = "study_products"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    school_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     name: Mapped[str] = mapped_column(String(160), index=True)
     product_type: Mapped[str] = mapped_column(String(30), index=True, comment="community/package/material")
     subtitle: Mapped[str] = mapped_column(String(255), default="")
@@ -182,6 +261,8 @@ class StudyProduct(Base, TimestampMixin):
     installment_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     installment_count: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    review_status: Mapped[str] = mapped_column(String(20), default="approved", index=True)
+    reject_reason: Mapped[str] = mapped_column(String(255), default="")
 
 
 class StudyContent(Base, TimestampMixin):
@@ -205,6 +286,7 @@ class StudyOrder(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
     user_id: Mapped[int] = mapped_column(Integer, index=True)
+    school_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     product_id: Mapped[int] = mapped_column(Integer, index=True)
     product_name: Mapped[str] = mapped_column(String(160))
     product_type: Mapped[str] = mapped_column(String(30), index=True)
@@ -215,6 +297,58 @@ class StudyOrder(Base, TimestampMixin):
     installment_no: Mapped[int] = mapped_column(Integer, default=1)
     installment_count: Mapped[int] = mapped_column(Integer, default=1)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CommerceOrder(Base, TimestampMixin):
+    """Order master table for paid commerce orders.
+
+    This table is the canonical order header for the optimized order creation
+    flow. It can contain one or more `CommerceOrderItem` rows.
+    """
+
+    __tablename__ = "commerce_orders"
+    __table_args__ = (
+        Index("ix_commerce_orders_user_status_created", "user_id", "status", "created_at"),
+        Index("ix_commerce_orders_payment_status_created", "payment_status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    school_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    payable_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    payment_method: Mapped[str] = mapped_column(String(20), default="balance", index=True)
+    payment_status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120), default="", index=True)
+    transaction_id: Mapped[str] = mapped_column(String(100), default="")
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cancel_reason: Mapped[str] = mapped_column(String(255), default="")
+
+
+class CommerceOrderItem(Base, TimestampMixin):
+    """Order item table for each purchased product."""
+
+    __tablename__ = "commerce_order_items"
+    __table_args__ = (
+        Index("ix_commerce_order_items_order_product", "order_id", "product_id"),
+        Index("ix_commerce_order_items_product_status", "product_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(Integer, index=True)
+    order_no: Mapped[str] = mapped_column(String(40), index=True)
+    product_id: Mapped[int] = mapped_column(Integer, index=True)
+    product_name: Mapped[str] = mapped_column(String(160))
+    product_type: Mapped[str] = mapped_column(String(30), index=True)
+    school_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    stock_deducted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
 
 
 class UserEntitlement(Base, TimestampMixin):
@@ -242,3 +376,47 @@ class LearningProfile(Base, TimestampMixin):
     checkin_days: Mapped[int] = mapped_column(Integer, default=0)
     last_checkin_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     advisor_notes: Mapped[str] = mapped_column(Text, default="")
+
+
+class GraduationCertification(Base, TimestampMixin):
+    __tablename__ = "graduation_certifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    real_name: Mapped[str] = mapped_column(String(60))
+    school_name: Mapped[str] = mapped_column(String(120))
+    major_name: Mapped[str] = mapped_column(String(120), default="")
+    graduation_date: Mapped[str] = mapped_column(String(20), default="")
+    certificate_no: Mapped[str] = mapped_column(String(80), default="")
+    certificate_image: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    reject_reason: Mapped[str] = mapped_column(String(255), default="")
+    reviewed_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class UploadedAsset(Base, TimestampMixin):
+    __tablename__ = "uploaded_assets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(40), default="common", index=True)
+    storage: Mapped[str] = mapped_column(String(20), default="local", index=True)
+    bucket: Mapped[str] = mapped_column(String(120), default="")
+    object_key: Mapped[str] = mapped_column(String(500), default="")
+    path: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(Text, default="")
+    filename: Mapped[str] = mapped_column(String(180), default="")
+    original_name: Mapped[str] = mapped_column(String(255), default="")
+    mime_type: Mapped[str] = mapped_column(String(120), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    uploader_role: Mapped[str] = mapped_column(String(20), default="", index=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+
+
+class SystemSetting(Base, TimestampMixin):
+    __tablename__ = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON)
+    remark: Mapped[str] = mapped_column(String(255), default="")

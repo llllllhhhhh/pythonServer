@@ -16,6 +16,7 @@ class StudyContentPayload(BaseModel):
 
 
 class StudyProductPayload(BaseModel):
+    school_id: int = 0
     name: str = Field(min_length=1, max_length=160)
     product_type: str = Field(pattern="^(community|package|material)$")
     subtitle: str = Field(default="", max_length=255)
@@ -31,7 +32,14 @@ class StudyProductPayload(BaseModel):
     installment_enabled: bool = False
     installment_count: int = Field(default=1, ge=1, le=24)
     status: bool = True
+    review_status: str = Field(default="pending", pattern="^(pending|approved|rejected)$")
+    reject_reason: str = Field(default="", max_length=255)
     contents: list[StudyContentPayload] = Field(default_factory=list)
+
+
+class StudyProductReviewPayload(BaseModel):
+    approved: bool
+    reject_reason: str = Field(default="", max_length=255)
 
 
 class StudyOrderCreate(BaseModel):
@@ -44,6 +52,7 @@ class StudyOrderOut(BaseModel):
     id: int
     order_no: str
     user_id: int
+    school_id: int = 0
     product_id: int
     product_name: str
     product_type: str

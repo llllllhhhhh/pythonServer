@@ -9,6 +9,7 @@ from app.api.router import api_router
 from app.core.cache import close_cache
 from app.core.config import settings
 from app.core.database import create_tables
+from app.core.exceptions import register_exception_handlers
 from app.seed import seed_data
 
 
@@ -27,6 +28,7 @@ app = FastAPI(
     description="学徒行用户端、管理端与客服中心统一 REST API",
     lifespan=lifespan,
 )
+register_exception_handlers(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,

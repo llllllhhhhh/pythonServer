@@ -7,6 +7,7 @@ from app.core.auth import generate_user_no, hash_password
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models import (
+    ContentArticle,
     DecorationConfig,
     InviteRelation,
     PlatformAnnouncement,
@@ -265,6 +266,44 @@ async def seed_data() -> None:
                         content="泰山经典游属于积分权益产品，仅限本人使用，不支持转让与折现。提交预约后可在“我的旅行”中查看审核进度。",
                         tag="出行提醒",
                         status=True,
+                        published_at=now,
+                    ),
+                ]
+            )
+        if not await db.scalar(select(ContentArticle.id).limit(1)):
+            now = datetime.now()
+            db.add_all(
+                [
+                    ContentArticle(
+                        title="用户协议",
+                        slug="user-agreement",
+                        summary="说明学徒行账号注册、学习服务、积分权益、定制旅行等基础使用规则。",
+                        content="欢迎使用学徒行。\n\n1. 你在注册、登录、购买学习服务、参与积分活动或预约旅行服务时，应提供真实、有效的信息。\n2. 平台展示的学习服务、资料包、积分权益和旅行路线以实际发布页面为准。\n3. 用户不得利用邀请、积分、客服、订单等功能进行刷量、作弊或侵犯他人权益。\n4. 如服务内容发生调整，平台将通过公告、文章或客服消息进行说明。\n5. 继续使用学徒行，即表示你已阅读并同意本协议。",
+                        category="协议规则",
+                        pinned=True,
+                        status=True,
+                        sort_order=1,
+                        published_at=now,
+                    ),
+                    ContentArticle(
+                        title="隐私政策",
+                        slug="privacy-policy",
+                        summary="说明平台如何收集、使用和保护手机号、客服记录、认证资料等信息。",
+                        content="学徒行重视你的隐私与信息安全。\n\n1. 我们会根据功能需要收集手机号、昵称、学习偏好、订单信息、客服聊天记录和录取通知书认证资料。\n2. 上述信息主要用于账号识别、注册审核、积分发放、客服沟通、订单预约和权益认证。\n3. 录取通知书等敏感图片仅用于认证审核，不会用于无关用途。\n4. 你可以通过客服或平台提供的功能申请修改密码、注销账号或咨询个人信息处理情况。\n5. 我们会采取合理安全措施保护数据，但请你也妥善保管账号密码。",
+                        category="协议规则",
+                        pinned=True,
+                        status=True,
+                        sort_order=2,
+                        published_at=now,
+                    ),
+                    ContentArticle(
+                        title="关于学徒行",
+                        slug="about-xuetuxing",
+                        summary="青年备考成长与定制旅行服务平台介绍。",
+                        content="学徒行是一款面向大学生与青年备考人群的小程序。\n\n我们希望把备考陪伴、学习资料、督学服务、积分邀友和定制旅行连接起来：认真学习时有人同行，上岸之后也能好好出发。\n\n平台当前提供学习服务商城、积分邀请、泰山游兑换、定制旅行、在线客服、公告文章和用户认证等能力。",
+                        category="平台介绍",
+                        status=True,
+                        sort_order=10,
                         published_at=now,
                     ),
                 ]

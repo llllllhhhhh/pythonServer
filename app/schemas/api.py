@@ -20,6 +20,15 @@ class DecorationResponse(BaseModel):
     published_at: datetime | None = None
 
 
+class UploadSettingPayload(BaseModel):
+    max_image_mb: int = Field(default=8, ge=1, le=50)
+
+
+class UploadSettingOut(BaseModel):
+    max_image_mb: int
+    max_image_bytes: int
+
+
 class RouteBase(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     category: str = "户外"
@@ -130,6 +139,97 @@ class AnnouncementOut(AnnouncementBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ArticleBase(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    slug: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    summary: str = Field(default="", max_length=255)
+    content: str = Field(default="", min_length=1)
+    category: str = Field(default="协议规则", max_length=40)
+    cover: str = ""
+    pinned: bool = False
+    status: bool = False
+    sort_order: int = 0
+    published_at: datetime | None = None
+
+
+class ArticleCreate(ArticleBase):
+    pass
+
+
+class ArticleUpdate(ArticleBase):
+    pass
+
+
+class ArticleOut(ArticleBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SchoolSiteBase(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    short_name: str = Field(default="", max_length=80)
+    city: str = Field(default="", max_length=60)
+    district: str = Field(default="", max_length=60)
+    logo: str = ""
+    status: bool = True
+    current: bool = False
+    review_status: str = Field(default="pending", pattern="^(pending|approved|rejected)$")
+    reject_reason: str = Field(default="", max_length=255)
+    merchant_account: str = Field(default="", max_length=60)
+    sort_order: int = 0
+    description: str = ""
+
+
+class SchoolSiteCreate(SchoolSiteBase):
+    merchant_password: str = Field(default="", max_length=50)
+
+
+class SchoolApplicationPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    short_name: str = Field(default="", max_length=80)
+    city: str = Field(default="", max_length=60)
+    district: str = Field(default="", max_length=60)
+    logo: str = ""
+    contact_name: str = Field(default="", max_length=60)
+    merchant_account: str = Field(min_length=3, max_length=60)
+    merchant_password: str = Field(min_length=6, max_length=50)
+    description: str = ""
+
+
+class SchoolApplicationResponse(BaseModel):
+    message: str
+    status: str
+
+
+class SchoolReviewPayload(BaseModel):
+    approved: bool
+    reject_reason: str = Field(default="", max_length=255)
+
+
+class MerchantPasswordPayload(BaseModel):
+    merchant_account: str = Field(min_length=3, max_length=60)
+    merchant_password: str = Field(min_length=6, max_length=50)
+
+
+class SchoolSiteUpdate(SchoolSiteBase):
+    pass
+
+
+class SchoolSiteOut(SchoolSiteBase):
+    id: int
+    has_merchant_password: bool = False
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MerchantLoginResponse(BaseModel):
+    token: str
+    school: SchoolSiteOut
+
+
 class SupportSessionPayload(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
     user_name: str = Field(default="小徒同学", max_length=60)
@@ -139,11 +239,35 @@ class RegisterPayload(BaseModel):
     phone: str = Field(min_length=6, max_length=30)
     password: str = Field(min_length=6, max_length=50)
     nickname: str = Field(default="小徒同学", max_length=60)
+    invite_code: str = Field(default="", max_length=64)
+    device_id: str = Field(default="", max_length=100)
 
 
 class RegisterSubmitResponse(BaseModel):
     message: str
     status: str
+    invitation_bound: bool = False
+
+
+class InviteRecordOut(BaseModel):
+    nickname: str
+    phone: str
+    status: str
+    score: int
+    score_granted: bool
+    created_at: datetime
+
+
+class InviteDashboardOut(BaseModel):
+    invite_code: str
+    invite_payload: str
+    points: int
+    invite_score: int
+    exchange_score: int
+    enabled: bool
+    invited_count: int
+    granted_count: int
+    records: list[InviteRecordOut]
 
 
 class LoginPayload(BaseModel):
@@ -160,7 +284,8 @@ class UserOut(BaseModel):
     status: str
     avatar: str = ""
     points: int = 0
-    exam_status: str = "备考中"
+    balance: Decimal = Decimal("0.00")
+    exam_status: str = "学员"
     is_registered: bool = True
     last_login_at: datetime | None = None
     created_at: datetime
@@ -189,11 +314,41 @@ class AdminUserRow(BaseModel):
     status: str
     is_registered: bool
     points: int
+    balance: Decimal = Decimal("0.00")
     exam_status: str
     created_at: datetime
     last_login_at: datetime | None = None
     conversation_count: int = 0
     open_conversation: bool = False
+    graduation_status: str = "not_submitted"
+
+
+class GraduationCertificationOut(BaseModel):
+    id: int
+    user_id: int
+    real_name: str
+    school_name: str
+    major_name: str
+    graduation_date: str
+    certificate_no: str
+    certificate_image: str
+    status: str
+    reject_reason: str
+    reviewed_by: int | None = None
+    reviewed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GraduationReviewPayload(BaseModel):
+    approved: bool
+    reject_reason: str = Field(default="", max_length=255)
+
+
+class AdminUserDetail(BaseModel):
+    user: AdminUserRow
+    graduation_certification: GraduationCertificationOut | None = None
 
 
 class RegistrationReviewPayload(BaseModel):
@@ -202,6 +357,12 @@ class RegistrationReviewPayload(BaseModel):
 
 class PasswordResetPayload(BaseModel):
     password: str = Field(min_length=6, max_length=50)
+
+
+class WalletAdjustPayload(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
+    direction: str = Field(default="income", pattern="^(income|expense)$")
+    remark: str = Field(default="", max_length=255)
 
 
 class StatusUpdatePayload(BaseModel):
@@ -222,3 +383,23 @@ class RegistrationRow(BaseModel):
 class AdminUsersResponse(BaseModel):
     summary: UserSummaryOut
     users: list[AdminUserRow]
+
+
+class UploadedAssetOut(BaseModel):
+    id: int
+    source: str
+    storage: str
+    bucket: str
+    object_key: str
+    path: str
+    url: str
+    filename: str
+    original_name: str
+    mime_type: str
+    size: int
+    uploader_role: str
+    user_id: int | None = None
+    conversation_id: str = ""
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
