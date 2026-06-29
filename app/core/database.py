@@ -115,6 +115,10 @@ async def run_schema_updates() -> None:
             if not await _column_exists(connection, table_name, column_name):
                 await connection.execute(text(statement))
 
+        await connection.execute(text("ALTER TABLE school_sites MODIFY reject_reason VARCHAR(255) NOT NULL DEFAULT ''"))
+        await connection.execute(text("ALTER TABLE school_sites MODIFY merchant_account VARCHAR(60) NOT NULL DEFAULT ''"))
+        await connection.execute(text("ALTER TABLE school_sites MODIFY merchant_password_hash VARCHAR(255) NOT NULL DEFAULT ''"))
+
         await connection.execute(
             text(
                 """
