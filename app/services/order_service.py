@@ -59,6 +59,12 @@ class OrderService:
         """
         idem_key = f"idem:order:{user.id}:{payload.idempotency_key}"
         result_key = f"{idem_key}:result"
+        existing_order = await cls.get_order_by_idempotency_key(db, user.id, payload.idempotency_key)
+        if existing_order:
+            logger.info("order_idempotent_db_hit", extra={"user_id": user.id, "order_no": existing_order.order_no})
+            return existing_order
+
+        redis_locked = False
         try:
             existing = await redis.get_json(result_key)
             if existing and existing.get("order_no"):
@@ -67,11 +73,11 @@ class OrderService:
                 if order:
                     return order
 
-            locked = await redis.setnx(idem_key, "processing", settings.order_idempotency_ttl_seconds)
-            if not locked:
+            redis_locked = await redis.setnx(idem_key, "processing", settings.order_idempotency_ttl_seconds)
+            if not redis_locked:
                 raise IdempotencyConflictError()
-        except RedisUnavailableError as exc:
-            raise RedisRequiredError() from exc
+        except RedisUnavailableError:
+            logger.warning("order_create_redis_unavailable_db_fallback", extra={"user_id": user.id})
 
         deducted: list[tuple[int, int]] = []
         try:
@@ -79,23 +85,26 @@ class OrderService:
             products = await cls._load_products(db, quantity_map)
             cls._validate_products(products, quantity_map)
 
-            await cls._pre_deduct_stock(products, quantity_map, deducted)
+            if redis_locked:
+                await cls._pre_deduct_stock(products, quantity_map, deducted)
             order = await cls._persist_order(db, user, payload, products, quantity_map)
 
-            try:
-                await redis.set_json(result_key, {"order_no": order.order_no}, settings.order_idempotency_ttl_seconds)
-            except Exception:  # pragma: no cover - Redis result cache should not invalidate committed orders.
-                logger.exception("order_idempotency_result_cache_failed", extra={"order_no": order.order_no})
+            if redis_locked:
+                try:
+                    await redis.set_json(result_key, {"order_no": order.order_no}, settings.order_idempotency_ttl_seconds)
+                except Exception:  # pragma: no cover - Redis result cache should not invalidate committed orders.
+                    logger.exception("order_idempotency_result_cache_failed", extra={"order_no": order.order_no})
             enqueue_order_payment_timeout(order.order_no)
             logger.info("order_created", extra={"order_no": order.order_no, "user_id": user.id, "amount": str(order.payable_amount)})
             return order
         except Exception:
             await db.rollback()
-            await cls._rollback_redis_stock(deducted)
-            try:
-                await redis.delete(idem_key)
-            except RedisUnavailableError:
-                logger.exception("order_idempotency_unlock_failed", extra={"key": idem_key})
+            if redis_locked:
+                await cls._rollback_redis_stock(deducted)
+                try:
+                    await redis.delete(idem_key)
+                except RedisUnavailableError:
+                    logger.exception("order_idempotency_unlock_failed", extra={"key": idem_key})
             logger.exception("order_create_failed", extra={"user_id": user.id, "idempotency_key": payload.idempotency_key})
             raise
 
@@ -168,17 +177,18 @@ class OrderService:
         Raises:
             BusinessError: If the order is not payable or the wallet balance is insufficient.
         """
-        if order.user_id != user.id:
+        locked_order = await db.scalar(select(CommerceOrder).where(CommerceOrder.id == order.id).with_for_update())
+        if not locked_order or locked_order.user_id != user.id:
             raise BusinessError("订单不存在", status_code=404, code="ORDER_NOT_FOUND")
-        if order.payment_status == "paid":
-            return order
-        if order.status != "pending":
+        if locked_order.payment_status == "paid":
+            return locked_order
+        if locked_order.status != "pending":
             raise BusinessError("订单当前状态不可支付", status_code=400, code="ORDER_NOT_PAYABLE")
 
         locked_user = await db.scalar(select(UserAccount).where(UserAccount.id == user.id).with_for_update())
         if not locked_user:
             raise BusinessError("用户不存在", status_code=404, code="USER_NOT_FOUND")
-        amount = Decimal(order.payable_amount or 0).quantize(Decimal("0.01"))
+        amount = Decimal(locked_order.payable_amount or 0).quantize(Decimal("0.01"))
         before = Decimal(locked_user.balance or 0).quantize(Decimal("0.01"))
         if before < amount:
             raise BusinessError("余额不足，请先充值后再购买", status_code=400, code="INSUFFICIENT_BALANCE")
@@ -195,13 +205,13 @@ class OrderService:
                 balance_before=before,
                 balance_after=after,
                 biz_type="purchase",
-                biz_id=order.id,
-                biz_no=order.order_no,
+                biz_id=locked_order.id,
+                biz_no=locked_order.order_no,
                 remark="购买学习产品",
             )
         )
-        logger.info("wallet_balance_deducted", extra={"order_no": order.order_no, "user_id": user.id, "amount": str(amount)})
-        return await cls.mark_order_paid(db, order, payment_method="balance", transaction_id=transaction_no)
+        logger.info("wallet_balance_deducted", extra={"order_no": locked_order.order_no, "user_id": user.id, "amount": str(amount)})
+        return await cls.mark_order_paid(db, locked_order, payment_method="balance", transaction_id=transaction_no)
 
     @classmethod
     async def cancel_unpaid_order_by_no(cls, order_no: str) -> dict[str, Any]:
@@ -214,7 +224,7 @@ class OrderService:
             Cancellation result summary.
         """
         async with SessionLocal() as db:
-            order = await cls.get_order_by_no(db, order_no)
+            order = await cls.get_order_by_no_for_update(db, order_no)
             if not order:
                 logger.warning("cancel_order_not_found", extra={"order_no": order_no})
                 return {"ok": False, "reason": "not_found", "order_no": order_no}
@@ -274,6 +284,23 @@ class OrderService:
     async def get_order_by_no(db: AsyncSession, order_no: str) -> CommerceOrder | None:
         """Return an order by order number."""
         return await db.scalar(select(CommerceOrder).where(CommerceOrder.order_no == order_no))
+
+    @staticmethod
+    async def get_order_by_no_for_update(db: AsyncSession, order_no: str) -> CommerceOrder | None:
+        """Return an order by order number and lock it for status changes."""
+        return await db.scalar(select(CommerceOrder).where(CommerceOrder.order_no == order_no).with_for_update())
+
+    @staticmethod
+    async def get_order_by_idempotency_key(db: AsyncSession, user_id: int, idempotency_key: str) -> CommerceOrder | None:
+        """Return a user's existing order created by an idempotency key."""
+        return await db.scalar(
+            select(CommerceOrder)
+            .where(
+                CommerceOrder.user_id == user_id,
+                CommerceOrder.idempotency_key == idempotency_key,
+            )
+            .order_by(CommerceOrder.id.desc())
+        )
 
     @classmethod
     async def _persist_order(

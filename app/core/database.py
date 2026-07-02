@@ -106,10 +106,43 @@ async def run_schema_updates() -> None:
             ("school_sites", "reject_reason", "ALTER TABLE school_sites ADD COLUMN reject_reason VARCHAR(255) NOT NULL DEFAULT ''"),
             ("school_sites", "merchant_account", "ALTER TABLE school_sites ADD COLUMN merchant_account VARCHAR(60) NOT NULL DEFAULT ''"),
             ("school_sites", "merchant_password_hash", "ALTER TABLE school_sites ADD COLUMN merchant_password_hash VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("school_sites", "display_weight", "ALTER TABLE school_sites ADD COLUMN display_weight INT NOT NULL DEFAULT 0"),
             ("study_products", "school_id", "ALTER TABLE study_products ADD COLUMN school_id INT NOT NULL DEFAULT 0"),
             ("study_products", "review_status", "ALTER TABLE study_products ADD COLUMN review_status VARCHAR(20) NOT NULL DEFAULT 'approved'"),
             ("study_products", "reject_reason", "ALTER TABLE study_products ADD COLUMN reject_reason VARCHAR(255) NOT NULL DEFAULT ''"),
             ("study_orders", "school_id", "ALTER TABLE study_orders ADD COLUMN school_id INT NOT NULL DEFAULT 0"),
+            ("commerce_order_items", "installment_count", "ALTER TABLE commerce_order_items ADD COLUMN installment_count INT NOT NULL DEFAULT 1"),
+            ("travel_routes", "display_weight", "ALTER TABLE travel_routes ADD COLUMN display_weight INT NOT NULL DEFAULT 0"),
+            ("travel_orders", "user_id", "ALTER TABLE travel_orders ADD COLUMN user_id INT NOT NULL DEFAULT 0"),
+            ("travel_orders", "user_no", "ALTER TABLE travel_orders ADD COLUMN user_no VARCHAR(64) NOT NULL DEFAULT ''"),
+            ("travel_orders", "contract_status", "ALTER TABLE travel_orders ADD COLUMN contract_status VARCHAR(20) NOT NULL DEFAULT 'unsigned'"),
+            ("travel_orders", "contract_signer_name", "ALTER TABLE travel_orders ADD COLUMN contract_signer_name VARCHAR(60) NOT NULL DEFAULT ''"),
+            ("travel_orders", "contract_signer_phone", "ALTER TABLE travel_orders ADD COLUMN contract_signer_phone VARCHAR(30) NOT NULL DEFAULT ''"),
+            ("travel_orders", "contract_id_no", "ALTER TABLE travel_orders ADD COLUMN contract_id_no VARCHAR(40) NOT NULL DEFAULT ''"),
+            ("travel_orders", "contract_signature_data", "ALTER TABLE travel_orders ADD COLUMN contract_signature_data MEDIUMTEXT NULL"),
+            ("travel_orders", "contract_signed_at", "ALTER TABLE travel_orders ADD COLUMN contract_signed_at DATETIME NULL"),
+            ("travel_orders", "contract_reviewed_at", "ALTER TABLE travel_orders ADD COLUMN contract_reviewed_at DATETIME NULL"),
+            ("travel_orders", "contract_reject_reason", "ALTER TABLE travel_orders ADD COLUMN contract_reject_reason VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("travel_orders", "fulfillment_status", "ALTER TABLE travel_orders ADD COLUMN fulfillment_status VARCHAR(30) NOT NULL DEFAULT 'contract_pending'"),
+            ("travel_orders", "pickup_address", "ALTER TABLE travel_orders ADD COLUMN pickup_address VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("travel_orders", "pickup_detail", "ALTER TABLE travel_orders ADD COLUMN pickup_detail VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("travel_orders", "traveler_count", "ALTER TABLE travel_orders ADD COLUMN traveler_count INT NOT NULL DEFAULT 1"),
+            ("travel_orders", "emergency_contact", "ALTER TABLE travel_orders ADD COLUMN emergency_contact VARCHAR(60) NOT NULL DEFAULT ''"),
+            ("travel_orders", "emergency_phone", "ALTER TABLE travel_orders ADD COLUMN emergency_phone VARCHAR(30) NOT NULL DEFAULT ''"),
+            ("travel_orders", "luggage_count", "ALTER TABLE travel_orders ADD COLUMN luggage_count INT NOT NULL DEFAULT 0"),
+            ("travel_orders", "pickup_note", "ALTER TABLE travel_orders ADD COLUMN pickup_note VARCHAR(500) NOT NULL DEFAULT ''"),
+            ("travel_orders", "pickup_time", "ALTER TABLE travel_orders ADD COLUMN pickup_time VARCHAR(60) NOT NULL DEFAULT ''"),
+            ("travel_orders", "pickup_location", "ALTER TABLE travel_orders ADD COLUMN pickup_location VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("travel_orders", "driver_name", "ALTER TABLE travel_orders ADD COLUMN driver_name VARCHAR(60) NOT NULL DEFAULT ''"),
+            ("travel_orders", "driver_phone", "ALTER TABLE travel_orders ADD COLUMN driver_phone VARCHAR(30) NOT NULL DEFAULT ''"),
+            ("travel_orders", "vehicle_no", "ALTER TABLE travel_orders ADD COLUMN vehicle_no VARCHAR(40) NOT NULL DEFAULT ''"),
+            ("travel_orders", "pickup_notice", "ALTER TABLE travel_orders ADD COLUMN pickup_notice VARCHAR(500) NOT NULL DEFAULT ''"),
+            ("travel_orders", "pickup_confirmed_at", "ALTER TABLE travel_orders ADD COLUMN pickup_confirmed_at DATETIME NULL"),
+            ("travel_orders", "qr_token", "ALTER TABLE travel_orders ADD COLUMN qr_token VARCHAR(80) NOT NULL DEFAULT ''"),
+            ("travel_orders", "qr_issued_at", "ALTER TABLE travel_orders ADD COLUMN qr_issued_at DATETIME NULL"),
+            ("travel_orders", "checked_in_at", "ALTER TABLE travel_orders ADD COLUMN checked_in_at DATETIME NULL"),
+            ("travel_orders", "completed_at", "ALTER TABLE travel_orders ADD COLUMN completed_at DATETIME NULL"),
+            ("travel_orders", "exception_reason", "ALTER TABLE travel_orders ADD COLUMN exception_reason VARCHAR(255) NOT NULL DEFAULT ''"),
         ]
         for table_name, column_name, statement in alter_statements:
             if not await _column_exists(connection, table_name, column_name):
@@ -198,6 +231,7 @@ async def run_schema_updates() -> None:
                   unit_price DECIMAL(10,2) NOT NULL DEFAULT 0,
                   quantity INT NOT NULL DEFAULT 1,
                   total_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+                  installment_count INT NOT NULL DEFAULT 1,
                   stock_deducted TINYINT(1) NOT NULL DEFAULT 0,
                   status VARCHAR(20) NOT NULL DEFAULT 'pending',
                   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -232,6 +266,46 @@ async def run_schema_updates() -> None:
             )
         )
 
+        await connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS custom_travel_requests (
+                  id INT AUTO_INCREMENT PRIMARY KEY,
+                  request_no VARCHAR(40) NOT NULL UNIQUE,
+                  user_id INT NOT NULL,
+                  user_no VARCHAR(64) NOT NULL,
+                  user_name VARCHAR(60) NOT NULL DEFAULT '',
+                  phone VARCHAR(30) NOT NULL DEFAULT '',
+                  destination VARCHAR(160) NOT NULL DEFAULT '',
+                  travel_time VARCHAR(80) NOT NULL DEFAULT '',
+                  days VARCHAR(40) NOT NULL DEFAULT '',
+                  budget VARCHAR(80) NOT NULL DEFAULT '',
+                  people_count VARCHAR(40) NOT NULL DEFAULT '',
+                  special_tags JSON NULL,
+                  note TEXT NULL,
+                  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                  reject_reason VARCHAR(255) NOT NULL DEFAULT '',
+                  plan_title VARCHAR(160) NOT NULL DEFAULT '',
+                  plan_summary TEXT NULL,
+                  plan_price VARCHAR(80) NOT NULL DEFAULT '',
+                  plan_itinerary JSON NULL,
+                  plan_includes JSON NULL,
+                  plan_tips TEXT NULL,
+                  reviewed_at DATETIME NULL,
+                  reviewed_by INT NULL,
+                  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  INDEX ix_custom_travel_requests_request_no (request_no),
+                  INDEX ix_custom_travel_requests_user_id (user_id),
+                  INDEX ix_custom_travel_requests_user_no (user_no),
+                  INDEX ix_custom_travel_requests_status (status),
+                  INDEX ix_custom_travel_user_status (user_id, status),
+                  INDEX ix_custom_travel_status_created (status, created_at)
+                )
+                """
+            )
+        )
+
         school_count = (
             await connection.execute(text("SELECT COUNT(*) FROM school_sites"))
         ).scalar() or 0
@@ -240,13 +314,13 @@ async def run_schema_updates() -> None:
                 text(
                     """
                     INSERT INTO school_sites
-                    (name, short_name, city, district, logo, status, is_current, review_status, sort_order, description)
+                    (name, short_name, city, district, logo, status, is_current, review_status, display_weight, sort_order, description)
                     VALUES
-                    ('水院-广东水利电力职业技术学院', '水院', '广州市', '从化区', '', 1, 1, 'approved', 1, '当前合作入驻站点'),
-                    ('广东食品药品职业学院', '', '广州市', '天河区', '', 1, 0, 'approved', 2, '已入驻站点'),
-                    ('厦门大学嘉庚学院', '', '厦门市', '龙海区', '', 1, 0, 'approved', 3, '已入驻站点'),
-                    ('广东行政职业学院', '', '广州市', '白云区', '', 1, 0, 'approved', 4, '已入驻站点'),
-                    ('广东职业技术学院', '', '佛山市', '高明区', '', 1, 0, 'approved', 5, '已入驻站点')
+                    ('水院-广东水利电力职业技术学院', '水院', '广州市', '从化区', '', 1, 1, 'approved', 50, 1, '当前合作入驻站点'),
+                    ('广东食品药品职业学院', '', '广州市', '天河区', '', 1, 0, 'approved', 40, 2, '已入驻站点'),
+                    ('厦门大学嘉庚学院', '', '厦门市', '龙海区', '', 1, 0, 'approved', 30, 3, '已入驻站点'),
+                    ('广东行政职业学院', '', '广州市', '白云区', '', 1, 0, 'approved', 20, 4, '已入驻站点'),
+                    ('广东职业技术学院', '', '佛山市', '高明区', '', 1, 0, 'approved', 10, 5, '已入驻站点')
                     """
                 )
             )

@@ -96,7 +96,12 @@ async def published_config(
 @router.get("/routes", response_model=list[RouteOut])
 async def public_routes(db: AsyncSession = Depends(get_db)):
     result = await db.scalars(
-        select(TravelRoute).where(TravelRoute.status.is_(True)).order_by(TravelRoute.id.desc())
+        select(TravelRoute)
+        .where(TravelRoute.status.is_(True))
+        .order_by(
+            TravelRoute.display_weight.desc(),
+            TravelRoute.id.desc(),
+        )
     )
     return list(result)
 
@@ -186,6 +191,7 @@ async def public_schools(keyword: str | None = None, db: AsyncSession = Depends(
         )
     result = await db.scalars(
         query.order_by(
+            SchoolSite.display_weight.desc(),
             SchoolSite.current.desc(),
             SchoolSite.sort_order.asc(),
             SchoolSite.id.desc(),

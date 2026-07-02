@@ -8,9 +8,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.public import PUBLIC_CONFIG_KEY
+from app.api.travel_orders import normalize_fulfillment_status
 from app.core.auth import hash_password
 from app.core.cache import cache_delete
 from app.core.config import settings
+from app.core.contract_settings import get_contract_template, save_contract_template
 from app.core.database import get_db
 from app.core.identity import resolve_user_identities, resolve_user_identity
 from app.core.security import require_admin
@@ -46,11 +48,14 @@ from app.schemas.api import (
     DecorationResponse,
     InviteOut,
     GraduationReviewPayload,
+    ContractReviewPayload,
+    ContractTemplateOut,
+    ContractTemplatePayload,
     OrderOut,
-    OrderReview,
     PasswordResetPayload,
     PointRuleOut,
     PointRulePayload,
+    PointsAdjustPayload,
     RegistrationReviewPayload,
     RegistrationRow,
     RouteCreate,
@@ -67,6 +72,8 @@ from app.schemas.api import (
     UploadSettingPayload,
     UserSummaryOut,
     WalletAdjustPayload,
+    TravelOrderExceptionPayload,
+    TravelPickupSchedulePayload,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
@@ -171,9 +178,26 @@ async def update_upload_settings(payload: UploadSettingPayload, db: AsyncSession
     return await save_upload_setting(db, payload.max_image_mb)
 
 
+@router.get("/contract-template", response_model=ContractTemplateOut)
+async def admin_contract_template(db: AsyncSession = Depends(get_db)):
+    return await get_contract_template(db)
+
+
+@router.put("/contract-template", response_model=ContractTemplateOut)
+async def update_admin_contract_template(payload: ContractTemplatePayload, db: AsyncSession = Depends(get_db)):
+    return await save_contract_template(db, payload.model_dump())
+
+
 @router.get("/routes", response_model=list[RouteOut])
 async def routes(db: AsyncSession = Depends(get_db)):
-    return list(await db.scalars(select(TravelRoute).order_by(TravelRoute.id.desc())))
+    return list(
+        await db.scalars(
+            select(TravelRoute).order_by(
+                TravelRoute.display_weight.desc(),
+                TravelRoute.id.desc(),
+            )
+        )
+    )
 
 
 @router.post("/routes", response_model=RouteOut, status_code=status.HTTP_201_CREATED)
@@ -349,6 +373,7 @@ async def school_sites(db: AsyncSession = Depends(get_db)):
         await db.scalars(
             select(SchoolSite).order_by(
                 SchoolSite.review_status.asc(),
+                SchoolSite.display_weight.desc(),
                 SchoolSite.sort_order.asc(),
                 SchoolSite.id.desc(),
             )
@@ -504,18 +529,136 @@ async def orders(order_status: int | None = Query(default=None, alias="status"),
     query = select(TravelOrder).order_by(TravelOrder.id.desc())
     if order_status is not None:
         query = query.where(TravelOrder.status == order_status)
-    return list(await db.scalars(query))
+    rows = list(await db.scalars(query))
+    changed = False
+    for item in rows:
+        before = item.fulfillment_status
+        normalize_fulfillment_status(item)
+        changed = changed or item.fulfillment_status != before
+    if changed:
+        await db.commit()
+    return rows
 
 
-@router.patch("/orders/{order_id}/review", response_model=OrderOut)
-async def review_order(order_id: int, payload: OrderReview, db: AsyncSession = Depends(get_db)):
+@router.patch("/orders/{order_id}/contract/review", response_model=OrderOut)
+async def review_order_contract(order_id: int, payload: ContractReviewPayload, db: AsyncSession = Depends(get_db)):
     item = await db.get(TravelOrder, order_id)
     if not item:
         raise HTTPException(status_code=404, detail="Order not found")
-    item.status = payload.status
-    item.reject_reason = payload.reject_reason
-    if payload.agency is not None:
-        item.agency = payload.agency
+    if item.contract_status not in {"pending", "rejected"}:
+        raise HTTPException(status_code=400, detail="该订单暂无待审核合同")
+    if payload.approved:
+        item.contract_status = "approved"
+        item.contract_reject_reason = ""
+        if item.fulfillment_status in {"", "contract_pending", "contract_reviewing", "contract_rejected"}:
+            item.fulfillment_status = "info_pending"
+    else:
+        reason = payload.reject_reason.strip()
+        if not reason:
+            raise HTTPException(status_code=422, detail="驳回合同时请填写原因")
+        item.contract_status = "rejected"
+        item.contract_reject_reason = reason
+        item.fulfillment_status = "contract_rejected"
+    item.contract_reviewed_at = datetime.now()
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/orders/{order_id}/pickup/schedule", response_model=OrderOut)
+async def schedule_order_pickup(order_id: int, payload: TravelPickupSchedulePayload, db: AsyncSession = Depends(get_db)):
+    item = await db.get(TravelOrder, order_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if item.contract_status != "approved":
+        raise HTTPException(status_code=400, detail="Contract must be approved before scheduling pickup")
+    if not item.pickup_address:
+        raise HTTPException(status_code=400, detail="User pickup information has not been submitted")
+    if item.fulfillment_status in {"checked_in", "in_trip", "completed", "cancelled"}:
+        raise HTTPException(status_code=400, detail="Current order status cannot be scheduled")
+    item.pickup_time = payload.pickup_time.strip()
+    item.pickup_location = payload.pickup_location.strip()
+    item.driver_name = payload.driver_name.strip()
+    item.driver_phone = payload.driver_phone.strip()
+    item.vehicle_no = payload.vehicle_no.strip()
+    item.pickup_notice = payload.pickup_notice.strip()
+    item.fulfillment_status = "pickup_confirmed"
+    item.pickup_confirmed_at = None
+    item.qr_token = ""
+    item.qr_issued_at = None
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/orders/{order_id}/qr/issue", response_model=OrderOut)
+async def issue_order_qr(order_id: int, db: AsyncSession = Depends(get_db)):
+    item = await db.get(TravelOrder, order_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if item.fulfillment_status not in {"user_confirmed", "qr_issued"}:
+        raise HTTPException(status_code=400, detail="User must confirm pickup before issuing QR")
+    item.qr_token = uuid4().hex
+    item.qr_issued_at = datetime.now()
+    item.fulfillment_status = "qr_issued"
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/orders/{order_id}/check-in", response_model=OrderOut)
+async def check_in_order(order_id: int, token: str, db: AsyncSession = Depends(get_db)):
+    item = await db.get(TravelOrder, order_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if item.fulfillment_status not in {"user_confirmed", "qr_issued"}:
+        raise HTTPException(status_code=400, detail="Order cannot be checked in")
+    if not item.qr_token or token != item.qr_token:
+        raise HTTPException(status_code=400, detail="Invalid check-in token")
+    item.checked_in_at = datetime.now()
+    item.fulfillment_status = "checked_in"
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/orders/{order_id}/trip/start", response_model=OrderOut)
+async def start_order_trip(order_id: int, db: AsyncSession = Depends(get_db)):
+    item = await db.get(TravelOrder, order_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if item.fulfillment_status not in {"checked_in", "in_trip"}:
+        raise HTTPException(status_code=400, detail="Order must be checked in before trip start")
+    item.fulfillment_status = "in_trip"
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/orders/{order_id}/complete", response_model=OrderOut)
+async def complete_order(order_id: int, db: AsyncSession = Depends(get_db)):
+    item = await db.get(TravelOrder, order_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if item.fulfillment_status not in {"checked_in", "in_trip", "completed"}:
+        raise HTTPException(status_code=400, detail="Order must be checked in before completion")
+    item.fulfillment_status = "completed"
+    item.completed_at = datetime.now()
+    item.status = 1
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/orders/{order_id}/exception", response_model=OrderOut)
+async def mark_order_exception(order_id: int, payload: TravelOrderExceptionPayload, db: AsyncSession = Depends(get_db)):
+    item = await db.get(TravelOrder, order_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if item.fulfillment_status == "completed":
+        raise HTTPException(status_code=400, detail="Completed order cannot be marked as exception")
+    item.fulfillment_status = "exception"
+    item.exception_reason = payload.reason.strip()
     await db.commit()
     await db.refresh(item)
     return item
@@ -731,6 +874,22 @@ async def adjust_user_wallet(user_id: int, payload: WalletAdjustPayload, db: Asy
             remark=payload.remark or ("后台充值" if payload.direction == "income" else "后台扣减"),
         )
     )
+    await db.commit()
+    await db.refresh(user)
+    conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
+    return build_user_row(user, conversations, exam_status=await resolve_user_identity(db, user.id))
+
+
+@router.post("/users/{user_id}/points/adjust", response_model=AdminUserRow)
+async def adjust_user_points(user_id: int, payload: PointsAdjustPayload, db: AsyncSession = Depends(get_db)):
+    user = await db.scalar(select(UserAccount).where(UserAccount.id == user_id, UserAccount.role == "user").with_for_update())
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    before = int(user.points or 0)
+    after = before + payload.amount if payload.direction == "income" else before - payload.amount
+    if after < 0:
+        raise HTTPException(status_code=400, detail="积分不足，不能扣减")
+    user.points = after
     await db.commit()
     await db.refresh(user)
     conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))

@@ -84,6 +84,7 @@ class TravelRoute(Base, TimestampMixin):
     agency: Mapped[str] = mapped_column(String(120), default="")
     image: Mapped[str] = mapped_column(Text, default="")
     description: Mapped[str] = mapped_column(Text, default="")
+    display_weight: Mapped[int] = mapped_column(Integer, default=0, index=True)
     status: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
@@ -104,6 +105,8 @@ class TravelOrder(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    user_no: Mapped[str] = mapped_column(String(64), default="", index=True)
     order_type: Mapped[str] = mapped_column(String(30), index=True)
     title: Mapped[str] = mapped_column(String(160))
     user_name: Mapped[str] = mapped_column(String(60))
@@ -113,6 +116,66 @@ class TravelOrder(Base, TimestampMixin):
     amount_text: Mapped[str] = mapped_column(String(60), default="")
     status: Mapped[int] = mapped_column(Integer, default=0, index=True)
     reject_reason: Mapped[str] = mapped_column(String(255), default="")
+    contract_status: Mapped[str] = mapped_column(String(20), default="unsigned", index=True)
+    contract_signer_name: Mapped[str] = mapped_column(String(60), default="")
+    contract_signer_phone: Mapped[str] = mapped_column(String(30), default="")
+    contract_id_no: Mapped[str] = mapped_column(String(40), default="")
+    contract_signature_data: Mapped[str] = mapped_column(Text, default="")
+    contract_signed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    contract_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    contract_reject_reason: Mapped[str] = mapped_column(String(255), default="")
+    fulfillment_status: Mapped[str] = mapped_column(String(30), default="contract_pending", index=True)
+    pickup_address: Mapped[str] = mapped_column(String(255), default="")
+    pickup_detail: Mapped[str] = mapped_column(String(255), default="")
+    traveler_count: Mapped[int] = mapped_column(Integer, default=1)
+    emergency_contact: Mapped[str] = mapped_column(String(60), default="")
+    emergency_phone: Mapped[str] = mapped_column(String(30), default="")
+    luggage_count: Mapped[int] = mapped_column(Integer, default=0)
+    pickup_note: Mapped[str] = mapped_column(String(500), default="")
+    pickup_time: Mapped[str] = mapped_column(String(60), default="")
+    pickup_location: Mapped[str] = mapped_column(String(255), default="")
+    driver_name: Mapped[str] = mapped_column(String(60), default="")
+    driver_phone: Mapped[str] = mapped_column(String(30), default="")
+    vehicle_no: Mapped[str] = mapped_column(String(40), default="")
+    pickup_notice: Mapped[str] = mapped_column(String(500), default="")
+    pickup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    qr_token: Mapped[str] = mapped_column(String(80), default="", index=True)
+    qr_issued_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    checked_in_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    exception_reason: Mapped[str] = mapped_column(String(255), default="")
+
+
+class CustomTravelRequest(Base, TimestampMixin):
+    __tablename__ = "custom_travel_requests"
+    __table_args__ = (
+        Index("ix_custom_travel_user_status", "user_id", "status"),
+        Index("ix_custom_travel_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_no: Mapped[str] = mapped_column(String(64), index=True)
+    user_name: Mapped[str] = mapped_column(String(60), default="")
+    phone: Mapped[str] = mapped_column(String(30), default="")
+    destination: Mapped[str] = mapped_column(String(160), default="")
+    travel_time: Mapped[str] = mapped_column(String(80), default="")
+    days: Mapped[str] = mapped_column(String(40), default="")
+    budget: Mapped[str] = mapped_column(String(80), default="")
+    people_count: Mapped[str] = mapped_column(String(40), default="")
+    special_tags: Mapped[list] = mapped_column(JSON, default=list)
+    note: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    reject_reason: Mapped[str] = mapped_column(String(255), default="")
+    plan_title: Mapped[str] = mapped_column(String(160), default="")
+    plan_summary: Mapped[str] = mapped_column(Text, default="")
+    plan_price: Mapped[str] = mapped_column(String(80), default="")
+    plan_itinerary: Mapped[list] = mapped_column(JSON, default=list)
+    plan_includes: Mapped[list] = mapped_column(JSON, default=list)
+    plan_tips: Mapped[str] = mapped_column(Text, default="")
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewed_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class InviteRelation(Base, TimestampMixin):
@@ -186,6 +249,7 @@ class SchoolSite(Base, TimestampMixin):
     reject_reason: Mapped[str] = mapped_column(String(255), default="")
     merchant_account: Mapped[str] = mapped_column(String(60), default="", index=True)
     merchant_password_hash: Mapped[str] = mapped_column(String(255), default="")
+    display_weight: Mapped[int] = mapped_column(Integer, default=0, index=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
     description: Mapped[str] = mapped_column(Text, default="")
 
@@ -347,6 +411,7 @@ class CommerceOrderItem(Base, TimestampMixin):
     unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     quantity: Mapped[int] = mapped_column(Integer, default=1)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
+    installment_count: Mapped[int] = mapped_column(Integer, default=1)
     stock_deducted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
 

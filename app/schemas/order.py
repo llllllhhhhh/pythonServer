@@ -9,6 +9,7 @@ class OrderCreateItem(BaseModel):
 
     product_id: int = Field(gt=0)
     quantity: int = Field(default=1, ge=1, le=99)
+    installment_count: int = Field(default=1, ge=1, le=24)
 
 
 class OrderCreateRequest(BaseModel):
@@ -30,6 +31,7 @@ class OrderItemOut(BaseModel):
     unit_price: Decimal
     quantity: int
     total_amount: Decimal
+    installment_count: int = 1
     stock_deducted: bool
     status: str
 

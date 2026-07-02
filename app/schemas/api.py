@@ -38,6 +38,7 @@ class RouteBase(BaseModel):
     agency: str = ""
     image: str = ""
     description: str = ""
+    display_weight: int = 0
     status: bool = True
 
 
@@ -71,6 +72,8 @@ class PointRuleOut(PointRulePayload):
 class OrderOut(BaseModel):
     id: int
     order_no: str
+    user_id: int = 0
+    user_no: str = ""
     order_type: str
     title: str
     user_name: str
@@ -80,14 +83,135 @@ class OrderOut(BaseModel):
     amount_text: str
     status: int
     reject_reason: str
+    contract_status: str = "unsigned"
+    contract_signer_name: str = ""
+    contract_signer_phone: str = ""
+    contract_id_no: str = ""
+    contract_signature_data: str | None = ""
+    contract_signed_at: datetime | None = None
+    contract_reviewed_at: datetime | None = None
+    contract_reject_reason: str = ""
+    fulfillment_status: str = "contract_pending"
+    pickup_address: str = ""
+    pickup_detail: str = ""
+    traveler_count: int = 1
+    emergency_contact: str = ""
+    emergency_phone: str = ""
+    luggage_count: int = 0
+    pickup_note: str = ""
+    pickup_time: str = ""
+    pickup_location: str = ""
+    driver_name: str = ""
+    driver_phone: str = ""
+    vehicle_no: str = ""
+    pickup_notice: str = ""
+    pickup_confirmed_at: datetime | None = None
+    qr_token: str = ""
+    qr_issued_at: datetime | None = None
+    checked_in_at: datetime | None = None
+    completed_at: datetime | None = None
+    exception_reason: str = ""
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
 
-class OrderReview(BaseModel):
-    status: int = Field(ge=1, le=2)
-    agency: str | None = None
+class RouteExchangePayload(BaseModel):
+    travel_date: str = Field(default="", max_length=30)
+
+
+class ContractTemplatePayload(BaseModel):
+    title: str = Field(default="旅行服务合同", min_length=1, max_length=120)
+    content: str = Field(min_length=1)
+    travel_date_days: int = Field(default=30, ge=0, le=365)
+
+
+class ContractTemplateOut(ContractTemplatePayload):
+    travel_date_options: list[str] = Field(default_factory=list)
+
+
+class ContractSignPayload(BaseModel):
+    signer_name: str = Field(min_length=1, max_length=60)
+    signer_phone: str = Field(min_length=6, max_length=30)
+    id_no: str = Field(min_length=1, max_length=40)
+    travel_date: str = Field(min_length=1, max_length=30)
+    signature_data: str = Field(min_length=60, max_length=500000)
+
+
+class ContractReviewPayload(BaseModel):
+    approved: bool
+    reject_reason: str = Field(default="", max_length=255)
+
+
+class TravelPickupInfoPayload(BaseModel):
+    pickup_address: str = Field(min_length=1, max_length=255)
+    pickup_detail: str = Field(default="", max_length=255)
+    traveler_count: int = Field(default=1, ge=1, le=99)
+    emergency_contact: str = Field(min_length=1, max_length=60)
+    emergency_phone: str = Field(min_length=6, max_length=30)
+    luggage_count: int = Field(default=0, ge=0, le=99)
+    pickup_note: str = Field(default="", max_length=500)
+
+
+class TravelPickupSchedulePayload(BaseModel):
+    pickup_time: str = Field(min_length=1, max_length=60)
+    pickup_location: str = Field(min_length=1, max_length=255)
+    driver_name: str = Field(default="", max_length=60)
+    driver_phone: str = Field(default="", max_length=30)
+    vehicle_no: str = Field(default="", max_length=40)
+    pickup_notice: str = Field(default="", max_length=500)
+
+
+class TravelOrderExceptionPayload(BaseModel):
+    reason: str = Field(min_length=1, max_length=255)
+
+
+class CustomTravelRequestCreate(BaseModel):
+    destination: str = Field(min_length=1, max_length=160)
+    travel_time: str = Field(default="", max_length=80)
+    days: str = Field(default="", max_length=40)
+    budget: str = Field(default="", max_length=80)
+    people_count: str = Field(default="", max_length=40)
+    special_tags: list[str] = Field(default_factory=list)
+    note: str = ""
+
+
+class CustomTravelReviewPayload(BaseModel):
+    approved: bool
+    reject_reason: str = Field(default="", max_length=255)
+    plan_title: str = Field(default="", max_length=160)
+    plan_summary: str = ""
+    plan_price: str = Field(default="", max_length=80)
+    plan_itinerary: list[str] = Field(default_factory=list)
+    plan_includes: list[str] = Field(default_factory=list)
+    plan_tips: str = ""
+
+
+class CustomTravelRequestOut(BaseModel):
+    id: int
+    request_no: str
+    user_id: int
+    user_no: str
+    user_name: str
+    phone: str
+    destination: str
+    travel_time: str
+    days: str
+    budget: str
+    people_count: str
+    special_tags: list[str] = Field(default_factory=list)
+    note: str = ""
+    status: str
     reject_reason: str = ""
+    plan_title: str = ""
+    plan_summary: str = ""
+    plan_price: str = ""
+    plan_itinerary: list[str] = Field(default_factory=list)
+    plan_includes: list[str] = Field(default_factory=list)
+    plan_tips: str = ""
+    reviewed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
 
 
 class InviteOut(BaseModel):
@@ -178,6 +302,7 @@ class SchoolSiteBase(BaseModel):
     review_status: str = Field(default="pending", pattern="^(pending|approved|rejected)$")
     reject_reason: str = Field(default="", max_length=255)
     merchant_account: str = Field(default="", max_length=60)
+    display_weight: int = 0
     sort_order: int = 0
     description: str = ""
 
@@ -361,6 +486,12 @@ class PasswordResetPayload(BaseModel):
 
 class WalletAdjustPayload(BaseModel):
     amount: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
+    direction: str = Field(default="income", pattern="^(income|expense)$")
+    remark: str = Field(default="", max_length=255)
+
+
+class PointsAdjustPayload(BaseModel):
+    amount: int = Field(gt=0, le=1000000)
     direction: str = Field(default="income", pattern="^(income|expense)$")
     remark: str = Field(default="", max_length=255)
 

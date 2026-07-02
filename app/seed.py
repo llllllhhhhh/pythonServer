@@ -161,6 +161,7 @@ async def seed_data() -> None:
                         price=3680,
                         stock=42,
                         agency="山海旅行",
+                        display_weight=30,
                         image="https://images.unsplash.com/photo-1464278533981-50106e6176b1?w=700",
                     ),
                     TravelRoute(
@@ -170,6 +171,7 @@ async def seed_data() -> None:
                         price=1580,
                         stock=28,
                         agency="知行文旅",
+                        display_weight=20,
                         image="https://images.unsplash.com/photo-1528127269322-539801943592?w=700",
                     ),
                     TravelRoute(
@@ -179,6 +181,7 @@ async def seed_data() -> None:
                         price=1880,
                         stock=0,
                         agency="青年假日",
+                        display_weight=10,
                         status=False,
                         image="https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=700",
                     ),
@@ -189,6 +192,8 @@ async def seed_data() -> None:
                 [
                     TravelOrder(
                         order_no="TS20260621008",
+                        user_id=user1.id,
+                        user_no=user1.user_no,
                         order_type="积分兑换",
                         title="泰山经典游 2天1夜",
                         user_name="林晓雪",
@@ -199,6 +204,8 @@ async def seed_data() -> None:
                     ),
                     TravelOrder(
                         order_no="DZ20260621016",
+                        user_id=user2.id,
+                        user_no=user2.user_no,
                         order_type="人工定制",
                         title="川西雪山深度定制",
                         user_name="陈泽宇",
@@ -379,4 +386,11 @@ async def seed_data() -> None:
             decoration.content = normalize_points_text(decoration.content)
         for order in list(await db.scalars(select(TravelOrder))):
             order.amount_text = normalize_points_text(order.amount_text)
+            if not order.user_id:
+                if order.phone.endswith("8032"):
+                    order.user_id = user1.id
+                    order.user_no = user1.user_no
+                elif order.phone.endswith("2177"):
+                    order.user_id = user2.id
+                    order.user_no = user2.user_no
         await db.commit()
