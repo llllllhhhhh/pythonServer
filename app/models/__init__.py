@@ -1,4 +1,4 @@
-from app.models.entities import (
+﻿from app.models.entities import (
     DecorationConfig,
     ContentArticle,
     SchoolSite,
@@ -10,8 +10,10 @@ from app.models.entities import (
     SupportConversation,
     SupportMessage,
     CustomTravelRequest,
+    ContractTemplateSnapshot,
     TravelOrder,
     TravelRoute,
+    TravelRouteReview,
     UserAccount,
     UserSession,
     WalletTransaction,
@@ -39,8 +41,10 @@ __all__ = [
     "SupportConversation",
     "SupportMessage",
     "CustomTravelRequest",
+    "ContractTemplateSnapshot",
     "TravelOrder",
     "TravelRoute",
+    "TravelRouteReview",
     "UserAccount",
     "UserSession",
     "WalletTransaction",
@@ -55,3 +59,5 @@ __all__ = [
     "UploadedAsset",
     "SystemSetting",
 ]
+
+

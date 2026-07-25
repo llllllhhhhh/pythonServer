@@ -1,7 +1,7 @@
-from datetime import datetime
+﻿from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, Numeric, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -18,14 +18,14 @@ class UserAccount(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_no: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     phone: Mapped[str] = mapped_column(String(30), unique=True, index=True)
-    nickname: Mapped[str] = mapped_column(String(60), default="小徒同学")
+    nickname: Mapped[str] = mapped_column(String(60), default="灏忓緬鍚屽")
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default="user", index=True)
     status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     avatar: Mapped[str] = mapped_column(Text, default="")
     points: Mapped[int] = mapped_column(Integer, default=0)
     balance: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
-    exam_status: Mapped[str] = mapped_column(String(20), default="学员")
+    exam_status: Mapped[str] = mapped_column(String(20), default="瀛﹀憳")
     is_registered: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -76,16 +76,40 @@ class TravelRoute(Base, TimestampMixin):
     __tablename__ = "travel_routes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    school_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     name: Mapped[str] = mapped_column(String(120), index=True)
-    category: Mapped[str] = mapped_column(String(40), default="户外")
-    days: Mapped[str] = mapped_column(String(30), default="3天2夜")
-    price: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, comment="所需积分")
+    category: Mapped[str] = mapped_column(String(40), default="鎴峰")
+    days: Mapped[str] = mapped_column(String(30), default="3 days")
+    price: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0, comment="鎵€闇€绉垎")
     stock: Mapped[int] = mapped_column(Integer, default=0)
     agency: Mapped[str] = mapped_column(String(120), default="")
     image: Mapped[str] = mapped_column(Text, default="")
     description: Mapped[str] = mapped_column(Text, default="")
     display_weight: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    review_status: Mapped[str] = mapped_column(String(20), default="approved", index=True)
+    reject_reason: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class TravelRouteReview(Base, TimestampMixin):
+    __tablename__ = "travel_route_reviews"
+    __table_args__ = (
+        UniqueConstraint("order_id", name="uq_travel_route_reviews_order"),
+        Index("ix_travel_route_reviews_route_status_created", "route_id", "status", "created_at"),
+        Index("ix_travel_route_reviews_user_route", "user_id", "route_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    route_id: Mapped[int] = mapped_column(Integer, index=True)
+    order_id: Mapped[int] = mapped_column(Integer, index=True)
+    order_no: Mapped[str] = mapped_column(String(40), default="", index=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_no: Mapped[str] = mapped_column(String(64), default="", index=True)
+    user_name: Mapped[str] = mapped_column(String(60), default="")
+    rating: Mapped[int] = mapped_column(Integer, default=5, index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    images: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
 
 
 class PointRule(Base, TimestampMixin):
@@ -107,6 +131,7 @@ class TravelOrder(Base, TimestampMixin):
     order_no: Mapped[str] = mapped_column(String(40), unique=True, index=True)
     user_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     user_no: Mapped[str] = mapped_column(String(64), default="", index=True)
+    route_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     order_type: Mapped[str] = mapped_column(String(30), index=True)
     title: Mapped[str] = mapped_column(String(160))
     user_name: Mapped[str] = mapped_column(String(60))
@@ -114,13 +139,17 @@ class TravelOrder(Base, TimestampMixin):
     travel_date: Mapped[str] = mapped_column(String(30), default="")
     agency: Mapped[str] = mapped_column(String(120), default="")
     amount_text: Mapped[str] = mapped_column(String(60), default="")
+    cover: Mapped[str | None] = mapped_column(Text, default="", nullable=True)
     status: Mapped[int] = mapped_column(Integer, default=0, index=True)
     reject_reason: Mapped[str] = mapped_column(String(255), default="")
     contract_status: Mapped[str] = mapped_column(String(20), default="unsigned", index=True)
     contract_signer_name: Mapped[str] = mapped_column(String(60), default="")
     contract_signer_phone: Mapped[str] = mapped_column(String(30), default="")
     contract_id_no: Mapped[str] = mapped_column(String(40), default="")
+    contract_template_version: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    contract_template_snapshot_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     contract_signature_data: Mapped[str] = mapped_column(Text, default="")
+    contract_signature_url: Mapped[str] = mapped_column(Text, default="")
     contract_signed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     contract_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     contract_reject_reason: Mapped[str] = mapped_column(String(255), default="")
@@ -145,6 +174,17 @@ class TravelOrder(Base, TimestampMixin):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     exception_reason: Mapped[str] = mapped_column(String(255), default="")
 
+
+
+class ContractTemplateSnapshot(Base, TimestampMixin):
+    __tablename__ = "contract_template_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(120), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    travel_date_days: Mapped[int] = mapped_column(Integer, default=30)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
 
 class CustomTravelRequest(Base, TimestampMixin):
     __tablename__ = "custom_travel_requests"
@@ -195,7 +235,7 @@ class PreferenceEvent(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
-    user_name: Mapped[str] = mapped_column(String(60), default="小徒同学")
+    user_name: Mapped[str] = mapped_column(String(60), default="灏忓緬鍚屽")
     preference_type: Mapped[str] = mapped_column(String(20), index=True)
     target_key: Mapped[str] = mapped_column(String(120), index=True)
     target_name: Mapped[str] = mapped_column(String(160))
@@ -210,7 +250,7 @@ class PlatformAnnouncement(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(160), index=True)
     summary: Mapped[str] = mapped_column(String(255), default="")
     content: Mapped[str] = mapped_column(Text, default="")
-    tag: Mapped[str] = mapped_column(String(40), default="平台公告")
+    tag: Mapped[str] = mapped_column(String(40), default="骞冲彴鍏憡")
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     status: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
@@ -226,7 +266,7 @@ class ContentArticle(Base, TimestampMixin):
     slug: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     summary: Mapped[str] = mapped_column(String(255), default="")
     content: Mapped[str] = mapped_column(Text, default="")
-    category: Mapped[str] = mapped_column(String(40), default="协议规则", index=True)
+    category: Mapped[str] = mapped_column(String(40), default="鍗忚瑙勫垯", index=True)
     cover: Mapped[str] = mapped_column(Text, default="")
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     status: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
@@ -269,7 +309,7 @@ class SupportConversation(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
-    user_name: Mapped[str] = mapped_column(String(60), default="小徒同学")
+    user_name: Mapped[str] = mapped_column(String(60), default="灏忓緬鍚屽")
     status: Mapped[str] = mapped_column(String(20), default="open", index=True)
     last_message: Mapped[str] = mapped_column(String(255), default="")
     unread_admin: Mapped[int] = mapped_column(Integer, default=0)
@@ -299,6 +339,7 @@ class SupportMessage(Base):
     sender_name: Mapped[str] = mapped_column(String(60))
     content: Mapped[str] = mapped_column(Text, default="")
     message_type: Mapped[str] = mapped_column(String(20), default="text")
+    extra: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True)
     image_url: Mapped[str] = mapped_column(Text, default="")
     image_thumb_url: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
@@ -372,6 +413,7 @@ class CommerceOrder(Base, TimestampMixin):
 
     __tablename__ = "commerce_orders"
     __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_commerce_orders_user_idempotency"),
         Index("ix_commerce_orders_user_status_created", "user_id", "status", "created_at"),
         Index("ix_commerce_orders_payment_status_created", "payment_status", "created_at"),
     )
@@ -435,8 +477,8 @@ class LearningProfile(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
-    target_exam: Mapped[str] = mapped_column(String(80), default="待设置")
-    current_stage: Mapped[str] = mapped_column(String(80), default="基础阶段")
+    target_exam: Mapped[str] = mapped_column(String(80), default="pending")
+    current_stage: Mapped[str] = mapped_column(String(80), default="鍩虹闃舵")
     total_minutes: Mapped[int] = mapped_column(Integer, default=0)
     checkin_days: Mapped[int] = mapped_column(Integer, default=0)
     last_checkin_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -485,3 +527,7 @@ class SystemSetting(Base, TimestampMixin):
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[dict] = mapped_column(JSON)
     remark: Mapped[str] = mapped_column(String(255), default="")
+
+
+
+

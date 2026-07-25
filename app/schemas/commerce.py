@@ -1,7 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+from app.core.order_status import COMMERCE_PAYMENT_STATUS_TEXT, status_label
 
 
 class StudyContentPayload(BaseModel):
@@ -64,6 +66,12 @@ class StudyOrderOut(BaseModel):
     installment_count: int
     paid_at: datetime | None
     created_at: datetime
+
+    @computed_field
+    @property
+    def payment_status_text(self) -> str:
+        return status_label(COMMERCE_PAYMENT_STATUS_TEXT, self.payment_status)
+
     model_config = ConfigDict(from_attributes=True)
 
 

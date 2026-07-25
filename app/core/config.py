@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -19,7 +20,7 @@ class Settings(BaseSettings):
     mysql_password: str = "xuetuxing123"
     mysql_database: str = "xuetuxing"
     redis_url: str = "redis://127.0.0.1:6379/0"
-    redis_enabled: bool = False
+    redis_enabled: bool = True
     order_idempotency_ttl_seconds: int = 600
     order_payment_timeout_minutes: int = 30
     snowflake_worker_id: int = 1
@@ -38,6 +39,12 @@ class Settings(BaseSettings):
     default_admin_nickname: str = "学徒行管理员"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @model_validator(mode="after")
+    def validate_runtime_requirements(self) -> "Settings":
+        if not self.redis_enabled:
+            raise ValueError("REDIS_ENABLED must be true. Standard order idempotency and stock locking require Redis.")
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:

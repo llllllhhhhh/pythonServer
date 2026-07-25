@@ -8,7 +8,7 @@
 - FastAPI + Uvicorn
 - SQLAlchemy 2.x 异步 ORM
 - MySQL 8.x
-- Redis，可选
+- Redis，必需。标准订单创建依赖 Redis 做幂等锁和库存预扣，开发与生产环境都必须启用。
 - WebSocket 实时客服
 - OBS / 本地上传存储
 
@@ -54,7 +54,7 @@ MYSQL_USER=xuetuxing
 MYSQL_PASSWORD=你的数据库密码
 MYSQL_DATABASE=xuetuxing
 
-REDIS_ENABLED=false
+REDIS_ENABLED=true
 REDIS_URL=redis://127.0.0.1:6379/0
 
 CORS_ORIGINS=http://localhost:5178,http://127.0.0.1:5178,http://113.44.149.128
@@ -262,6 +262,7 @@ sudo systemctl reload nginx
 
 - 创建订单要求传 `idempotency_key`。
 - 后端先查数据库中同用户同 `idempotency_key` 的历史订单，再用 Redis `SETNX` 防并发创建。
+- `commerce_orders` 对 `(user_id, idempotency_key)` 有唯一约束，作为 Redis 并发锁之外的数据库兜底。
 - 支付时会锁定订单行和用户余额行，重复请求同一订单只会返回已支付订单，不会重复扣款。
 - 自动取消未支付订单时也锁订单行，避免支付和取消同时改状态。
 - 有限库存商品会先用 Redis 预扣，再在 MySQL 中扣减；失败会回滚 Redis 库存。

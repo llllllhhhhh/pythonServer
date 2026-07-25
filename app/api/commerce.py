@@ -11,7 +11,9 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
 from app.core.exceptions import BusinessError
-from app.models import CommerceOrder, LearningProfile, SchoolSite, StudyContent, StudyOrder, StudyProduct, UserAccount, UserEntitlement, WalletTransaction
+from app.core.order_status import CommercePaymentStatus, ReviewStatus
+from app.models import CommerceOrder, LearningProfile, SchoolSite, StudyContent, StudyOrder, StudyProduct, TravelRoute, UserAccount, UserEntitlement, WalletTransaction
+from app.schemas.api import RouteCreate, RouteOut, RouteUpdate
 from app.schemas.commerce import (
     LearningProfileUpdate,
     StudyOrderCreate,
@@ -101,7 +103,7 @@ async def replace_contents(db: AsyncSession, product_id: int, rows: list) -> Non
 async def public_products(product_type: str | None = Query(default=None), db: AsyncSession = Depends(get_db)):
     query = select(StudyProduct).where(
         StudyProduct.status.is_(True),
-        StudyProduct.review_status == "approved",
+        StudyProduct.review_status == ReviewStatus.APPROVED,
     )
     if product_type:
         query = query.where(StudyProduct.product_type == product_type)
@@ -112,7 +114,7 @@ async def public_products(product_type: str | None = Query(default=None), db: As
 @router.get("/public/study/products/{product_id}")
 async def public_product_detail(product_id: int, db: AsyncSession = Depends(get_db)):
     item = await db.get(StudyProduct, product_id)
-    if not item or not item.status or item.review_status != "approved":
+    if not item or not item.status or item.review_status != ReviewStatus.APPROVED:
         raise HTTPException(status_code=404, detail="商品不存在或已下架")
     return product_dict(item, await product_contents(db, product_id))
 
@@ -124,7 +126,7 @@ async def create_study_order(
     db: AsyncSession = Depends(get_db),
 ):
     product = await db.get(StudyProduct, payload.product_id)
-    if not product or not product.status or product.review_status != "approved":
+    if not product or not product.status or product.review_status != ReviewStatus.APPROVED:
         raise HTTPException(status_code=404, detail="商品不存在或已下架")
     if product.stock == 0:
         raise HTTPException(status_code=400, detail="商品库存不足")
@@ -259,12 +261,12 @@ async def mock_pay(order_id: int, user: UserAccount = Depends(get_current_user),
     order = await db.get(StudyOrder, order_id)
     if not order or order.user_id != user.id:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.payment_status == "paid":
+    if order.payment_status == CommercePaymentStatus.PAID:
         return order
     product = await db.get(StudyProduct, order.product_id)
     if not product:
         raise HTTPException(status_code=404, detail="商品不存在")
-    order.payment_status, order.payment_method = "paid", "mock"
+    order.payment_status, order.payment_method = CommercePaymentStatus.PAID, "mock"
     order.transaction_id, order.paid_at = f"MOCK-{uuid4().hex.upper()}", datetime.now()
     await grant_entitlement(db, order, product)
     await db.commit()
@@ -369,7 +371,7 @@ async def admin_products(db: AsyncSession = Depends(get_db)):
 @router.post("/admin/study/products", dependencies=[Depends(require_admin)], status_code=201)
 async def create_product(payload: StudyProductPayload, db: AsyncSession = Depends(get_db)):
     data = payload.model_dump(exclude={"contents"})
-    data["review_status"] = "approved"
+    data["review_status"] = ReviewStatus.APPROVED
     data["reject_reason"] = ""
     item = StudyProduct(**data)
     db.add(item)
@@ -386,7 +388,7 @@ async def update_product(product_id: int, payload: StudyProductPayload, db: Asyn
     if not item:
         raise HTTPException(status_code=404, detail="商品不存在")
     data = payload.model_dump(exclude={"contents"})
-    if item.review_status != "approved":
+    if item.review_status != ReviewStatus.APPROVED:
         data["status"] = False
     for key, value in data.items():
         setattr(item, key, value)
@@ -401,7 +403,7 @@ async def review_product(product_id: int, payload: StudyProductReviewPayload, db
     item = await db.get(StudyProduct, product_id)
     if not item:
         raise HTTPException(status_code=404, detail="商品不存在")
-    item.review_status = "approved" if payload.approved else "rejected"
+    item.review_status = ReviewStatus.APPROVED if payload.approved else ReviewStatus.REJECTED
     item.reject_reason = "" if payload.approved else payload.reject_reason
     item.status = bool(payload.approved)
     await db.commit()
@@ -414,7 +416,7 @@ async def set_product_status(product_id: int, enabled: bool, db: AsyncSession = 
     item = await db.get(StudyProduct, product_id)
     if not item:
         raise HTTPException(status_code=404, detail="商品不存在")
-    if enabled and item.review_status != "approved":
+    if enabled and item.review_status != ReviewStatus.APPROVED:
         raise HTTPException(status_code=400, detail="产品需要先审核通过")
     item.status = enabled
     await db.commit()
@@ -453,7 +455,7 @@ async def merchant_create_product(
 ):
     data = payload.model_dump(exclude={"contents"})
     data["school_id"] = school.id
-    data["review_status"] = "pending"
+    data["review_status"] = ReviewStatus.PENDING
     data["reject_reason"] = ""
     data["status"] = False
     item = StudyProduct(**data)
@@ -477,7 +479,7 @@ async def merchant_update_product(
         raise HTTPException(status_code=404, detail="商品不存在")
     data = payload.model_dump(exclude={"contents"})
     data["school_id"] = school.id
-    data["review_status"] = "pending"
+    data["review_status"] = ReviewStatus.PENDING
     data["reject_reason"] = ""
     data["status"] = False
     for key, value in data.items():
@@ -486,6 +488,98 @@ async def merchant_update_product(
     await db.commit()
     await db.refresh(item)
     return product_dict(item, await product_contents(db, item.id, True))
+
+
+@router.patch("/merchant/study/products/{product_id}/status")
+async def merchant_set_product_status(
+    product_id: int,
+    enabled: bool,
+    school: SchoolSite = Depends(get_current_school),
+    db: AsyncSession = Depends(get_db),
+):
+    item = await db.get(StudyProduct, product_id)
+    if not item or item.school_id != school.id:
+        raise HTTPException(status_code=404, detail="商品不存在")
+    if enabled and item.review_status != ReviewStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="产品需要先审核通过")
+    item.status = enabled
+    await db.commit()
+    await db.refresh(item)
+    return product_dict(item, await product_contents(db, item.id, True))
+
+
+@router.get("/merchant/travel/routes", response_model=list[RouteOut])
+async def merchant_travel_routes(
+    school: SchoolSite = Depends(get_current_school),
+    db: AsyncSession = Depends(get_db),
+):
+    return list(
+        await db.scalars(
+            select(TravelRoute)
+            .where(TravelRoute.school_id == school.id)
+            .order_by(TravelRoute.id.desc())
+        )
+    )
+
+
+@router.post("/merchant/travel/routes", response_model=RouteOut, status_code=status.HTTP_201_CREATED)
+async def merchant_create_travel_route(
+    payload: RouteCreate,
+    school: SchoolSite = Depends(get_current_school),
+    db: AsyncSession = Depends(get_db),
+):
+    data = payload.model_dump()
+    data["school_id"] = school.id
+    data["agency"] = data.get("agency") or school.name
+    data["review_status"] = ReviewStatus.PENDING
+    data["reject_reason"] = ""
+    data["status"] = False
+    item = TravelRoute(**data)
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.put("/merchant/travel/routes/{route_id}", response_model=RouteOut)
+async def merchant_update_travel_route(
+    route_id: int,
+    payload: RouteUpdate,
+    school: SchoolSite = Depends(get_current_school),
+    db: AsyncSession = Depends(get_db),
+):
+    item = await db.get(TravelRoute, route_id)
+    if not item or item.school_id != school.id:
+        raise HTTPException(status_code=404, detail="Route not found")
+    data = payload.model_dump()
+    data["school_id"] = school.id
+    data["agency"] = data.get("agency") or school.name
+    data["review_status"] = ReviewStatus.PENDING
+    data["reject_reason"] = ""
+    data["status"] = False
+    for key, value in data.items():
+        setattr(item, key, value)
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/merchant/travel/routes/{route_id}/status", response_model=RouteOut)
+async def merchant_set_travel_route_status(
+    route_id: int,
+    enabled: bool,
+    school: SchoolSite = Depends(get_current_school),
+    db: AsyncSession = Depends(get_db),
+):
+    item = await db.get(TravelRoute, route_id)
+    if not item or item.school_id != school.id:
+        raise HTTPException(status_code=404, detail="Route not found")
+    if enabled and item.review_status != ReviewStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="Route needs platform approval first")
+    item.status = enabled
+    await db.commit()
+    await db.refresh(item)
+    return item
 
 
 @router.get("/merchant/study/orders", response_model=list[StudyOrderOut])

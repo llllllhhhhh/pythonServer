@@ -2,7 +2,13 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+
+from app.core.order_status import (
+    TRAVEL_CONTRACT_STATUS_TEXT,
+    TRAVEL_FULFILLMENT_STATUS_TEXT,
+    status_label,
+)
 
 
 class DecorationPayload(BaseModel):
@@ -52,7 +58,61 @@ class RouteUpdate(RouteBase):
 
 class RouteOut(RouteBase):
     id: int
+    school_id: int = 0
+    review_status: str = "approved"
+    reject_reason: str = ""
     model_config = ConfigDict(from_attributes=True)
+
+
+class RouteReviewPayload(BaseModel):
+    approved: bool
+    reject_reason: str = ""
+
+
+class TravelRouteReviewCreate(BaseModel):
+    order_id: int = 0
+    rating: int = Field(ge=1, le=5)
+    content: str = Field(default="", max_length=1200)
+    images: list[str] = Field(default_factory=list, max_length=6)
+
+
+class TravelRouteReviewOut(BaseModel):
+    id: int
+    route_id: int
+    order_id: int
+    order_no: str = ""
+    user_id: int
+    user_no: str = ""
+    user_name: str = ""
+    rating: int
+    content: str = ""
+    images: list[str] = Field(default_factory=list)
+    status: str = "published"
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("images", mode="before")
+    @classmethod
+    def _empty_images_for_null(cls, value):
+        return value if isinstance(value, list) else []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TravelRouteReviewListOut(BaseModel):
+    route_id: int
+    count: int
+    average_rating: float
+    items: list[TravelRouteReviewOut]
+
+
+class TravelRouteReviewEligibilityOut(BaseModel):
+    route_id: int
+    can_review: bool
+    reason: str = ""
+    eligible_order_id: int = 0
+    eligible_order_no: str = ""
+    reviewed_order_ids: list[int] = Field(default_factory=list)
 
 
 class PointRulePayload(BaseModel):
@@ -74,6 +134,7 @@ class OrderOut(BaseModel):
     order_no: str
     user_id: int = 0
     user_no: str = ""
+    route_id: int = 0
     order_type: str
     title: str
     user_name: str
@@ -81,13 +142,21 @@ class OrderOut(BaseModel):
     travel_date: str
     agency: str
     amount_text: str
+    cover: str | None = ""
+    image: str = ""
     status: int
     reject_reason: str
     contract_status: str = "unsigned"
     contract_signer_name: str = ""
     contract_signer_phone: str = ""
     contract_id_no: str = ""
+    contract_template_version: int = 0
+    contract_template_snapshot_id: int = 0
+    contract_template_title: str = ""
+    contract_template_content: str = ""
+    contract_template_travel_date_days: int = 0
     contract_signature_data: str | None = ""
+    contract_signature_url: str = ""
     contract_signed_at: datetime | None = None
     contract_reviewed_at: datetime | None = None
     contract_reject_reason: str = ""
@@ -112,6 +181,63 @@ class OrderOut(BaseModel):
     completed_at: datetime | None = None
     exception_reason: str = ""
     created_at: datetime
+
+    @field_validator(
+        "user_no",
+        "order_type",
+        "title",
+        "user_name",
+        "phone",
+        "travel_date",
+        "agency",
+        "amount_text",
+        "cover",
+        "image",
+        "reject_reason",
+        "contract_status",
+        "contract_signer_name",
+        "contract_signer_phone",
+        "contract_id_no",
+        "contract_template_title",
+        "contract_template_content",
+        "contract_signature_data",
+        "contract_signature_url",
+        "contract_reject_reason",
+        "fulfillment_status",
+        "pickup_address",
+        "pickup_detail",
+        "emergency_contact",
+        "emergency_phone",
+        "pickup_note",
+        "pickup_time",
+        "pickup_location",
+        "driver_name",
+        "driver_phone",
+        "vehicle_no",
+        "pickup_notice",
+        "qr_token",
+        "exception_reason",
+        mode="before",
+    )
+    @classmethod
+    def _empty_string_for_null(cls, value):
+        return "" if value is None else value
+
+    @computed_field
+    @property
+    def contract_status_text(self) -> str:
+        return status_label(TRAVEL_CONTRACT_STATUS_TEXT, self.contract_status, "unsigned")
+
+    @computed_field
+    @property
+    def fulfillment_status_text(self) -> str:
+        return status_label(TRAVEL_FULFILLMENT_STATUS_TEXT, self.fulfillment_status)
+
+    @computed_field
+    @property
+    def contract_signature_image(self) -> str:
+        return self.contract_signature_url or self.contract_signature_data or ""
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -120,12 +246,16 @@ class RouteExchangePayload(BaseModel):
 
 
 class ContractTemplatePayload(BaseModel):
-    title: str = Field(default="旅行服务合同", min_length=1, max_length=120)
+    title: str = Field(default="鏃呰鏈嶅姟鍚堝悓", min_length=1, max_length=120)
     content: str = Field(min_length=1)
     travel_date_days: int = Field(default=30, ge=0, le=365)
 
 
 class ContractTemplateOut(ContractTemplatePayload):
+    version: int = 0
+    snapshot_id: int = 0
+    contract_template_version: int = 0
+    contract_template_snapshot_id: int = 0
     travel_date_options: list[str] = Field(default_factory=list)
 
 
@@ -228,7 +358,7 @@ class InviteOut(BaseModel):
 
 class PreferenceEventPayload(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
-    user_name: str = Field(default="小徒同学", max_length=60)
+    user_name: str = Field(default="灏忓緬鍚屽", max_length=60)
     preference_type: str = Field(pattern="^(route|study)$")
     target_key: str = Field(min_length=1, max_length=120)
     target_name: str = Field(min_length=1, max_length=160)
@@ -240,7 +370,7 @@ class AnnouncementBase(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     summary: str = Field(default="", max_length=255)
     content: str = Field(default="", min_length=1)
-    tag: str = Field(default="平台公告", max_length=40)
+    tag: str = Field(default="骞冲彴鍏憡", max_length=40)
     pinned: bool = False
     status: bool = False
     published_at: datetime | None = None
@@ -268,7 +398,7 @@ class ArticleBase(BaseModel):
     slug: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     summary: str = Field(default="", max_length=255)
     content: str = Field(default="", min_length=1)
-    category: str = Field(default="协议规则", max_length=40)
+    category: str = Field(default="鍗忚瑙勫垯", max_length=40)
     cover: str = ""
     pinned: bool = False
     status: bool = False
@@ -357,13 +487,13 @@ class MerchantLoginResponse(BaseModel):
 
 class SupportSessionPayload(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
-    user_name: str = Field(default="小徒同学", max_length=60)
+    user_name: str = Field(default="灏忓緬鍚屽", max_length=60)
 
 
 class RegisterPayload(BaseModel):
     phone: str = Field(min_length=6, max_length=30)
     password: str = Field(min_length=6, max_length=50)
-    nickname: str = Field(default="小徒同学", max_length=60)
+    nickname: str = Field(default="灏忓緬鍚屽", max_length=60)
     invite_code: str = Field(default="", max_length=64)
     device_id: str = Field(default="", max_length=100)
 
@@ -410,7 +540,7 @@ class UserOut(BaseModel):
     avatar: str = ""
     points: int = 0
     balance: Decimal = Decimal("0.00")
-    exam_status: str = "学员"
+    exam_status: str = "瀛﹀憳"
     is_registered: bool = True
     last_login_at: datetime | None = None
     created_at: datetime
@@ -534,3 +664,7 @@ class UploadedAssetOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+
+
+

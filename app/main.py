@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.router import api_router
-from app.core.cache import close_cache
+from app.core.cache import close_cache, ensure_cache_available
 from app.core.config import settings
 from app.core.database import create_tables
 from app.core.exceptions import register_exception_handlers
@@ -16,6 +16,7 @@ from app.seed import seed_data
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+    await ensure_cache_available()
     await create_tables()
     await seed_data()
     yield

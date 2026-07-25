@@ -122,6 +122,17 @@ class RedisClient:
 redis = RedisClient(redis_client)
 
 
+async def ensure_cache_available() -> None:
+    """Fail fast when Redis is enabled but unreachable."""
+    if redis_client is None:
+        raise RedisUnavailableError("Redis is not enabled")
+    try:
+        await redis_client.ping()
+    except Exception as exc:  # pragma: no cover - depends on external Redis.
+        logger.exception("redis_startup_ping_failed")
+        raise RedisUnavailableError("Redis is unreachable") from exc
+
+
 async def close_cache() -> None:
     if redis_client is not None:
         await redis_client.aclose()

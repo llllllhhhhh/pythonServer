@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import json
 from io import BytesIO
 from collections import defaultdict
 from datetime import datetime
@@ -53,6 +54,14 @@ def build_image_thumbnail(content: bytes, max_width: int = 360) -> bytes | None:
 
 
 def message_dict(message: SupportMessage) -> dict:
+    extra = message.extra or {}
+    if message.message_type == "order_card" and not extra and message.content:
+        try:
+            parsed = json.loads(message.content)
+            if isinstance(parsed, dict):
+                extra = parsed
+        except Exception:
+            extra = {}
     return {
         "id": message.id,
         "conversation_id": message.conversation_id,
@@ -60,6 +69,7 @@ def message_dict(message: SupportMessage) -> dict:
         "sender_name": message.sender_name,
         "content": message.content,
         "message_type": message.message_type,
+        "extra": extra,
         "image_url": message.image_url,
         "image_thumb_url": message.image_thumb_url or "",
         "created_at": message.created_at.isoformat() if message.created_at else datetime.now().isoformat(),
@@ -149,6 +159,8 @@ async def sync_presence(conversation_id: str) -> None:
 def _message_preview(content: str, message_type: str) -> str:
     if message_type == "image":
         return "[图片]"
+    if message_type == "order_card":
+        return "[订单卡片]"
     return content[:255]
 
 
@@ -474,12 +486,23 @@ async def support_websocket(
                 continue
             content = str(data.get("content", "")).strip()[:2000]
             message_type = str(data.get("message_type", "text")).strip() or "text"
+            extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
             image_url = str(data.get("image_url", "")).strip()
             image_thumb_url = str(data.get("image_thumb_url", "")).strip()
             if message_type == "image" and not image_url:
                 await websocket.send_json({"type": "error", "message": "鍥剧墖娑堟伅缂哄皯鍦板潃"})
                 continue
             if message_type == "text" and not content:
+                continue
+            if message_type == "order_card" and not extra and content:
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        extra = parsed
+                        content = str(parsed.get("title") or parsed.get("orderNo") or "[订单卡片]")[:2000]
+                except Exception:
+                    pass
+            if message_type == "order_card" and not extra:
                 continue
             async with SessionLocal() as db:
                 conversation = await db.get(SupportConversation, conversation_id)
@@ -498,6 +521,7 @@ async def support_websocket(
                     sender_name=sender_name,
                     content=content,
                     message_type=message_type,
+                    extra=extra,
                     image_url=image_url,
                     image_thumb_url=image_thumb_url,
                 )

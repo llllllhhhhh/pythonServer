@@ -5,12 +5,14 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.cache import RedisUnavailableError, redis
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.exceptions import IdempotencyConflictError, InsufficientStockError, RedisRequiredError, BusinessError
+from app.core.order_status import CommerceOrderStatus, CommercePaymentStatus, ReviewStatus
 from app.core.snowflake import SnowflakeGenerator
 from app.models import (
     CommerceOrder,
@@ -76,8 +78,9 @@ class OrderService:
             redis_locked = await redis.setnx(idem_key, "processing", settings.order_idempotency_ttl_seconds)
             if not redis_locked:
                 raise IdempotencyConflictError()
-        except RedisUnavailableError:
-            logger.warning("order_create_redis_unavailable_db_fallback", extra={"user_id": user.id})
+        except RedisUnavailableError as exc:
+            logger.exception("order_create_redis_required", extra={"user_id": user.id})
+            raise RedisRequiredError() from exc
 
         deducted: list[tuple[int, int]] = []
         try:
@@ -87,7 +90,21 @@ class OrderService:
 
             if redis_locked:
                 await cls._pre_deduct_stock(products, quantity_map, deducted)
-            order = await cls._persist_order(db, user, payload, products, quantity_map)
+            try:
+                order = await cls._persist_order(db, user, payload, products, quantity_map)
+            except IntegrityError as exc:
+                await db.rollback()
+                if redis_locked:
+                    await cls._rollback_redis_stock(deducted)
+                    try:
+                        await redis.delete(idem_key)
+                    except RedisUnavailableError:
+                        logger.exception("order_idempotency_unlock_failed", extra={"key": idem_key})
+                existing_order = await cls.get_order_by_idempotency_key(db, user.id, payload.idempotency_key)
+                if existing_order:
+                    logger.info("order_idempotent_unique_hit", extra={"user_id": user.id, "order_no": existing_order.order_no})
+                    return existing_order
+                raise exc
 
             if redis_locked:
                 try:
@@ -121,13 +138,13 @@ class OrderService:
         Returns:
             Paid order.
         """
-        if order.payment_status == "paid":
+        if order.payment_status == CommercePaymentStatus.PAID:
             return order
-        if order.status != "pending":
+        if order.status != CommerceOrderStatus.PENDING:
             raise BusinessError("订单当前状态不可支付", status_code=400, code="ORDER_NOT_PAYABLE")
 
-        order.payment_status = "paid"
-        order.status = "paid"
+        order.payment_status = CommercePaymentStatus.PAID
+        order.status = CommerceOrderStatus.PAID
         order.payment_method = payment_method
         order.transaction_id = transaction_id
         order.paid_at = datetime.now()
@@ -152,7 +169,7 @@ class OrderService:
                         expires_at=cls._entitlement_expiry(product),
                     )
                 )
-            item.status = "paid"
+            item.status = CommerceOrderStatus.PAID
 
         if not await db.scalar(select(LearningProfile).where(LearningProfile.user_id == order.user_id)):
             db.add(LearningProfile(user_id=order.user_id))
@@ -180,9 +197,9 @@ class OrderService:
         locked_order = await db.scalar(select(CommerceOrder).where(CommerceOrder.id == order.id).with_for_update())
         if not locked_order or locked_order.user_id != user.id:
             raise BusinessError("订单不存在", status_code=404, code="ORDER_NOT_FOUND")
-        if locked_order.payment_status == "paid":
+        if locked_order.payment_status == CommercePaymentStatus.PAID:
             return locked_order
-        if locked_order.status != "pending":
+        if locked_order.status != CommerceOrderStatus.PENDING:
             raise BusinessError("订单当前状态不可支付", status_code=400, code="ORDER_NOT_PAYABLE")
 
         locked_user = await db.scalar(select(UserAccount).where(UserAccount.id == user.id).with_for_update())
@@ -243,7 +260,7 @@ class OrderService:
         Returns:
             Whether the order was changed.
         """
-        if order.payment_status == "paid" or order.status != "pending":
+        if order.payment_status == CommercePaymentStatus.PAID or order.status != CommerceOrderStatus.PENDING:
             logger.info("skip_cancel_order_not_pending", extra={"order_no": order.order_no, "status": order.status})
             return False
 
@@ -255,7 +272,7 @@ class OrderService:
         }
         for item in items:
             if not item.stock_deducted:
-                item.status = "canceled"
+                item.status = CommerceOrderStatus.CANCELED
                 continue
             product = products.get(item.product_id)
             if product and product.stock >= 0:
@@ -265,10 +282,10 @@ class OrderService:
             except RedisUnavailableError:
                 logger.exception("redis_restore_stock_failed", extra={"order_no": order.order_no, "product_id": item.product_id})
             item.stock_deducted = False
-            item.status = "canceled"
+            item.status = CommerceOrderStatus.CANCELED
 
-        order.status = "canceled"
-        order.payment_status = "canceled"
+        order.status = CommerceOrderStatus.CANCELED
+        order.payment_status = CommercePaymentStatus.CANCELED
         order.cancel_reason = reason
         order.canceled_at = datetime.now()
         await db.commit()
@@ -322,8 +339,8 @@ class OrderService:
             total_amount=total_amount,
             payable_amount=total_amount,
             payment_method=payload.payment_method,
-            payment_status="pending",
-            status="pending",
+            payment_status=CommercePaymentStatus.PENDING,
+            status=CommerceOrderStatus.PENDING,
             idempotency_key=payload.idempotency_key,
         )
         db.add(order)
@@ -346,7 +363,7 @@ class OrderService:
                     quantity=quantity,
                     total_amount=Decimal(product.price) * quantity,
                     stock_deducted=stock_deducted,
-                    status="pending",
+                    status=CommerceOrderStatus.PENDING,
                 )
             )
 
@@ -379,7 +396,7 @@ class OrderService:
         """Validate product status and finite database stock."""
         for product_id, quantity in quantity_map.items():
             product = products.get(product_id)
-            if not product or not product.status or product.review_status != "approved":
+            if not product or not product.status or product.review_status != ReviewStatus.APPROVED:
                 raise BusinessError(f"商品 {product_id} 不存在或已下架", status_code=404, code="PRODUCT_NOT_AVAILABLE")
             if product.stock >= 0 and product.stock < quantity:
                 raise InsufficientStockError(f"商品「{product.name}」库存不足")

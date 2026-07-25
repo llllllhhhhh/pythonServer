@@ -1,7 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+from app.core.order_status import COMMERCE_ORDER_STATUS_TEXT, COMMERCE_PAYMENT_STATUS_TEXT, status_label
 
 
 class OrderCreateItem(BaseModel):
@@ -35,6 +37,11 @@ class OrderItemOut(BaseModel):
     stock_deducted: bool
     status: str
 
+    @computed_field
+    @property
+    def status_text(self) -> str:
+        return status_label(COMMERCE_ORDER_STATUS_TEXT, self.status)
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -56,5 +63,15 @@ class OrderOut(BaseModel):
     cancel_reason: str
     created_at: datetime
     items: list[OrderItemOut] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def payment_status_text(self) -> str:
+        return status_label(COMMERCE_PAYMENT_STATUS_TEXT, self.payment_status)
+
+    @computed_field
+    @property
+    def status_text(self) -> str:
+        return status_label(COMMERCE_ORDER_STATUS_TEXT, self.status)
 
     model_config = ConfigDict(from_attributes=True)

@@ -10,6 +10,7 @@ from app.core.cache import cache_get_json, cache_set_json
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.storage import load_upload_bytes
+from app.core.travel_match_settings import get_travel_match_settings
 from app.core.upload_settings import get_upload_setting
 from app.models import ContentArticle, DecorationConfig, PlatformAnnouncement, PointRule, PreferenceEvent, SchoolSite, TravelRoute, UploadedAsset
 from app.schemas.api import AnnouncementOut, ArticleOut, PointRuleOut, PreferenceEventPayload, RouteOut, SchoolSiteOut
@@ -97,7 +98,10 @@ async def published_config(
 async def public_routes(db: AsyncSession = Depends(get_db)):
     result = await db.scalars(
         select(TravelRoute)
-        .where(TravelRoute.status.is_(True))
+        .where(
+            TravelRoute.status.is_(True),
+            TravelRoute.review_status == "approved",
+        )
         .order_by(
             TravelRoute.display_weight.desc(),
             TravelRoute.id.desc(),
@@ -211,6 +215,11 @@ async def public_point_rule(db: AsyncSession = Depends(get_db)):
 @router.get("/upload/settings")
 async def public_upload_settings(db: AsyncSession = Depends(get_db)):
     return await get_upload_setting(db)
+
+
+@router.get("/travel-match/settings")
+async def public_travel_match_settings(db: AsyncSession = Depends(get_db)):
+    return await get_travel_match_settings(db)
 
 
 @router.post("/preferences/events", status_code=201)
