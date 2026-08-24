@@ -1,4 +1,5 @@
 ﻿from datetime import datetime
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -17,6 +18,7 @@ from app.core.database import get_db
 from app.core.identity import resolve_user_identities, resolve_user_identity
 from app.core.order_status import TravelContractStatus, TravelFulfillmentStatus
 from app.core.security import require_admin
+from app.core.slider_captcha import get_slider_captcha_settings, save_slider_captcha_settings
 from app.core.travel_match_settings import get_travel_match_settings, save_travel_match_settings
 from app.core.upload_settings import get_upload_setting, save_upload_setting
 from app.models import (
@@ -30,7 +32,9 @@ from app.models import (
     SchoolSite,
     SupportConversation,
     TravelOrder,
+    TravelOrderAuditLog,
     TravelRoute,
+    TravelVerificationRecord,
     UploadedAsset,
     UserAccount,
     UserSession,
@@ -69,14 +73,24 @@ from app.schemas.api import (
     SchoolSiteOut,
     SchoolSiteUpdate,
     SchoolReviewPayload,
+    SliderCaptchaSettingsOut,
+    SliderCaptchaSettingsPayload,
     StatusUpdatePayload,
     UploadedAssetOut,
     UploadSettingOut,
     UploadSettingPayload,
     UserSummaryOut,
     WalletAdjustPayload,
+    TravelOrderCancelPayload,
     TravelOrderExceptionPayload,
     TravelPickupSchedulePayload,
+)
+from app.services.point_service import PointService
+from app.services.travel_order_service import (
+    add_travel_audit,
+    add_verification_record,
+    cancel_travel_order,
+    qr_expiry,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
@@ -179,6 +193,19 @@ async def upload_settings(db: AsyncSession = Depends(get_db)):
 @router.put("/upload/settings", response_model=UploadSettingOut)
 async def update_upload_settings(payload: UploadSettingPayload, db: AsyncSession = Depends(get_db)):
     return await save_upload_setting(db, payload.max_image_mb)
+
+
+@router.get("/slider-captcha/settings", response_model=SliderCaptchaSettingsOut)
+async def admin_slider_captcha_settings(db: AsyncSession = Depends(get_db)):
+    return await get_slider_captcha_settings(db)
+
+
+@router.put("/slider-captcha/settings", response_model=SliderCaptchaSettingsOut)
+async def update_admin_slider_captcha_settings(
+    payload: SliderCaptchaSettingsPayload,
+    db: AsyncSession = Depends(get_db),
+):
+    return await save_slider_captcha_settings(db, payload.model_dump())
 
 
 @router.get("/contract-template", response_model=ContractTemplateOut)
@@ -572,12 +599,18 @@ async def orders(order_status: int | None = Query(default=None, alias="status"),
 
 
 @router.patch("/orders/{order_id}/contract/review", response_model=OrderOut)
-async def review_order_contract(order_id: int, payload: ContractReviewPayload, db: AsyncSession = Depends(get_db)):
+async def review_order_contract(
+    order_id: int,
+    payload: ContractReviewPayload,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     item = await db.get(TravelOrder, order_id)
     if not item:
         raise HTTPException(status_code=404, detail="Order not found")
     if item.contract_status not in {TravelContractStatus.PENDING, TravelContractStatus.REJECTED}:
-        raise HTTPException(status_code=400, detail="璇ヨ鍗曟殏鏃犲緟瀹℃牳鍚堝悓")
+        raise HTTPException(status_code=400, detail="该订单当前没有待审核合同")
+    previous_status = str(item.contract_status or "")
     if payload.approved:
         item.contract_status = TravelContractStatus.APPROVED
         item.contract_reject_reason = ""
@@ -591,18 +624,36 @@ async def review_order_contract(order_id: int, payload: ContractReviewPayload, d
     else:
         reason = payload.reject_reason.strip()
         if not reason:
-            raise HTTPException(status_code=422, detail="椹冲洖鍚堝悓鏃惰濉啓鍘熷洜")
+            raise HTTPException(status_code=422, detail="驳回合同时请填写原因")
         item.contract_status = TravelContractStatus.REJECTED
         item.contract_reject_reason = reason
         item.fulfillment_status = TravelFulfillmentStatus.CONTRACT_REJECTED
     item.contract_reviewed_at = datetime.now()
+    add_travel_audit(
+        db,
+        item,
+        event_type="contract_approved" if payload.approved else "contract_rejected",
+        from_status=previous_status,
+        to_status=str(item.contract_status),
+        actor=admin_user,
+        reason=item.contract_reject_reason,
+        evidence={
+            "contract_template_version": item.contract_template_version,
+            "contract_template_snapshot_id": item.contract_template_snapshot_id,
+        },
+    )
     await db.commit()
     await db.refresh(item)
     return item
 
 
 @router.patch("/orders/{order_id}/pickup/schedule", response_model=OrderOut)
-async def schedule_order_pickup(order_id: int, payload: TravelPickupSchedulePayload, db: AsyncSession = Depends(get_db)):
+async def schedule_order_pickup(
+    order_id: int,
+    payload: TravelPickupSchedulePayload,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     item = await db.get(TravelOrder, order_id)
     if not item:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -617,6 +668,7 @@ async def schedule_order_pickup(order_id: int, payload: TravelPickupSchedulePayl
         TravelFulfillmentStatus.CANCELLED,
     }:
         raise HTTPException(status_code=400, detail="Current order status cannot be scheduled")
+    previous_status = str(item.fulfillment_status or "")
     item.pickup_time = payload.pickup_time.strip()
     item.pickup_location = payload.pickup_location.strip()
     item.driver_name = payload.driver_name.strip()
@@ -627,57 +679,179 @@ async def schedule_order_pickup(order_id: int, payload: TravelPickupSchedulePayl
     item.pickup_confirmed_at = None
     item.qr_token = ""
     item.qr_issued_at = None
+    item.qr_expires_at = None
+    add_travel_audit(
+        db,
+        item,
+        event_type="pickup_scheduled",
+        from_status=previous_status,
+        to_status=TravelFulfillmentStatus.PICKUP_CONFIRMED,
+        actor=admin_user,
+        evidence={
+            "pickup_time": item.pickup_time,
+            "pickup_location": item.pickup_location,
+            "vehicle_no": item.vehicle_no,
+        },
+    )
     await db.commit()
     await db.refresh(item)
     return item
 
 
 @router.patch("/orders/{order_id}/qr/issue", response_model=OrderOut)
-async def issue_order_qr(order_id: int, db: AsyncSession = Depends(get_db)):
+async def issue_order_qr(
+    order_id: int,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     item = await db.get(TravelOrder, order_id)
     if not item:
         raise HTTPException(status_code=404, detail="Order not found")
     if item.fulfillment_status not in {TravelFulfillmentStatus.USER_CONFIRMED, TravelFulfillmentStatus.QR_ISSUED}:
         raise HTTPException(status_code=400, detail="User must confirm pickup before issuing QR")
-    item.qr_token = uuid4().hex
-    item.qr_issued_at = datetime.now()
+    now = datetime.now()
+    if not item.qr_token or not item.qr_expires_at or item.qr_expires_at <= now:
+        item.qr_token = uuid4().hex
+        item.qr_issued_at = now
+        item.qr_expires_at = qr_expiry(item.travel_date)
+        add_verification_record(
+            db,
+            item,
+            action="issued",
+            token=item.qr_token,
+            result="success",
+            operator=admin_user,
+        )
     item.fulfillment_status = TravelFulfillmentStatus.QR_ISSUED
+    add_travel_audit(
+        db,
+        item,
+        event_type="qr_issued",
+        from_status=TravelFulfillmentStatus.USER_CONFIRMED,
+        to_status=TravelFulfillmentStatus.QR_ISSUED,
+        actor=admin_user,
+        evidence={"qr_expires_at": item.qr_expires_at.isoformat() if item.qr_expires_at else ""},
+    )
     await db.commit()
     await db.refresh(item)
     return item
 
 
 @router.patch("/orders/{order_id}/check-in", response_model=OrderOut)
-async def check_in_order(order_id: int, token: str, db: AsyncSession = Depends(get_db)):
+async def check_in_order(
+    order_id: int,
+    token: str,
+    device: str = Query(default="", max_length=255),
+    location: str = Query(default="", max_length=255),
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     item = await db.get(TravelOrder, order_id)
     if not item:
         raise HTTPException(status_code=404, detail="Order not found")
     if item.fulfillment_status not in {TravelFulfillmentStatus.USER_CONFIRMED, TravelFulfillmentStatus.QR_ISSUED}:
+        add_verification_record(
+            db,
+            item,
+            action="verify",
+            token=token,
+            result="rejected",
+            operator=admin_user,
+            device=device,
+            location=location,
+            reason="订单当前状态不可核销",
+        )
+        await db.commit()
         raise HTTPException(status_code=400, detail="Order cannot be checked in")
+    if item.qr_expires_at and item.qr_expires_at <= datetime.now():
+        add_verification_record(
+            db,
+            item,
+            action="verify",
+            token=token,
+            result="expired",
+            operator=admin_user,
+            device=device,
+            location=location,
+            reason="核销码已过期",
+        )
+        item.qr_token = ""
+        await db.commit()
+        raise HTTPException(status_code=400, detail="Check-in token has expired")
     if not item.qr_token or token != item.qr_token:
+        add_verification_record(
+            db,
+            item,
+            action="verify",
+            token=token,
+            result="failed",
+            operator=admin_user,
+            device=device,
+            location=location,
+            reason="核销码无效",
+        )
+        await db.commit()
         raise HTTPException(status_code=400, detail="Invalid check-in token")
+    previous_status = str(item.fulfillment_status or "")
+    used_token = item.qr_token
     item.checked_in_at = datetime.now()
     item.fulfillment_status = TravelFulfillmentStatus.CHECKED_IN
+    item.qr_token = ""
+    add_verification_record(
+        db,
+        item,
+        action="verify",
+        token=used_token,
+        result="success",
+        operator=admin_user,
+        device=device,
+        location=location,
+    )
+    add_travel_audit(
+        db,
+        item,
+        event_type="travel_checked_in",
+        from_status=previous_status,
+        to_status=TravelFulfillmentStatus.CHECKED_IN,
+        actor=admin_user,
+    )
     await db.commit()
     await db.refresh(item)
     return item
 
 
 @router.patch("/orders/{order_id}/trip/start", response_model=OrderOut)
-async def start_order_trip(order_id: int, db: AsyncSession = Depends(get_db)):
+async def start_order_trip(
+    order_id: int,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     item = await db.get(TravelOrder, order_id)
     if not item:
         raise HTTPException(status_code=404, detail="Order not found")
     if item.fulfillment_status not in {TravelFulfillmentStatus.CHECKED_IN, TravelFulfillmentStatus.IN_TRIP}:
         raise HTTPException(status_code=400, detail="Order must be checked in before trip start")
+    previous_status = str(item.fulfillment_status or "")
     item.fulfillment_status = TravelFulfillmentStatus.IN_TRIP
+    add_travel_audit(
+        db,
+        item,
+        event_type="trip_started",
+        from_status=previous_status,
+        to_status=TravelFulfillmentStatus.IN_TRIP,
+        actor=admin_user,
+    )
     await db.commit()
     await db.refresh(item)
     return item
 
 
 @router.patch("/orders/{order_id}/complete", response_model=OrderOut)
-async def complete_order(order_id: int, db: AsyncSession = Depends(get_db)):
+async def complete_order(
+    order_id: int,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     item = await db.get(TravelOrder, order_id)
     if not item:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -687,26 +861,93 @@ async def complete_order(order_id: int, db: AsyncSession = Depends(get_db)):
         TravelFulfillmentStatus.COMPLETED,
     }:
         raise HTTPException(status_code=400, detail="Order must be checked in before completion")
+    previous_status = str(item.fulfillment_status or "")
     item.fulfillment_status = TravelFulfillmentStatus.COMPLETED
     item.completed_at = datetime.now()
     item.status = 1
+    add_travel_audit(
+        db,
+        item,
+        event_type="order_completed",
+        from_status=previous_status,
+        to_status=TravelFulfillmentStatus.COMPLETED,
+        actor=admin_user,
+    )
     await db.commit()
     await db.refresh(item)
     return item
 
 
 @router.patch("/orders/{order_id}/exception", response_model=OrderOut)
-async def mark_order_exception(order_id: int, payload: TravelOrderExceptionPayload, db: AsyncSession = Depends(get_db)):
+async def mark_order_exception(
+    order_id: int,
+    payload: TravelOrderExceptionPayload,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     item = await db.get(TravelOrder, order_id)
     if not item:
         raise HTTPException(status_code=404, detail="Order not found")
     if item.fulfillment_status == TravelFulfillmentStatus.COMPLETED:
         raise HTTPException(status_code=400, detail="Completed order cannot be marked as exception")
+    previous_status = str(item.fulfillment_status or "")
     item.fulfillment_status = TravelFulfillmentStatus.EXCEPTION
     item.exception_reason = payload.reason.strip()
+    add_travel_audit(
+        db,
+        item,
+        event_type="order_exception",
+        from_status=previous_status,
+        to_status=TravelFulfillmentStatus.EXCEPTION,
+        actor=admin_user,
+        reason=item.exception_reason,
+    )
     await db.commit()
     await db.refresh(item)
     return item
+
+
+@router.patch("/orders/{order_id}/cancel", response_model=OrderOut)
+async def admin_cancel_travel_order(
+    order_id: int,
+    payload: TravelOrderCancelPayload,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await cancel_travel_order(
+        db,
+        order_id,
+        actor=admin_user,
+        reason=payload.reason,
+        admin_override=True,
+    )
+
+
+@router.get("/orders/{order_id}/audit")
+async def travel_order_audit(order_id: int, db: AsyncSession = Depends(get_db)):
+    order = await db.get(TravelOrder, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    events = list(
+        await db.scalars(
+            select(TravelOrderAuditLog)
+            .where(TravelOrderAuditLog.order_id == order_id)
+            .order_by(TravelOrderAuditLog.id)
+        )
+    )
+    verifications = list(
+        await db.scalars(
+            select(TravelVerificationRecord)
+            .where(TravelVerificationRecord.order_id == order_id)
+            .order_by(TravelVerificationRecord.id)
+        )
+    )
+    return {
+        "order_id": order.id,
+        "order_no": order.order_no,
+        "events": events,
+        "verifications": verifications,
+    }
 
 
 @router.get("/invites", response_model=list[InviteOut])
@@ -747,7 +988,7 @@ async def users(registered_only: bool = False, db: AsyncSession = Depends(get_db
         if user.role != "user":
             continue
         user_conversations = conv_map.get(user.user_no, [])
-        rows.append(build_user_row(user, user_conversations, graduation_map.get(user.id), identity_map.get(user.id, "瀛﹀憳")))
+        rows.append(build_user_row(user, user_conversations, graduation_map.get(user.id), identity_map.get(user.id, "学员")))
     admins = await db.scalar(select(func.count(UserAccount.id)).where(UserAccount.role == "admin")) or 0
     users_count = await db.scalar(select(func.count(UserAccount.id)).where(UserAccount.role == "user")) or 0
     registered = await db.scalar(
@@ -805,7 +1046,7 @@ async def review_graduation_certification(
     if not graduation:
         raise HTTPException(status_code=404, detail="Graduation certification not submitted")
     if not payload.approved and not payload.reject_reason.strip():
-        raise HTTPException(status_code=400, detail="椹冲洖鏃惰濉啓鍘熷洜")
+        raise HTTPException(status_code=400, detail="驳回时请填写原因")
     graduation.status = "approved" if payload.approved else "rejected"
     graduation.reject_reason = "" if payload.approved else payload.reject_reason.strip()
     graduation.reviewed_by = admin.id if admin else None
@@ -848,7 +1089,9 @@ async def review_registration(user_id: int, payload: RegistrationReviewPayload, 
             )
         )
         rule = await db.get(PointRule, 1)
-        if relation and (not rule or rule.enabled):
+        invite_enabled = bool((rule.enabled and rule.invite_enabled) if rule else True)
+        invite_score = int(rule.invite_score if rule else 1)
+        if relation and invite_enabled and invite_score > 0:
             inviter = await db.scalar(
                 select(UserAccount).where(
                     UserAccount.user_no == relation.inviter_id,
@@ -857,7 +1100,19 @@ async def review_registration(user_id: int, payload: RegistrationReviewPayload, 
                 )
             )
             if inviter:
-                inviter.points += rule.invite_score if rule else 1
+                inviter = await PointService.lock_user(db, inviter.id)
+                valid_days = max(1, int(rule.valid_days if rule else 365))
+                await PointService.credit_locked(
+                    db,
+                    inviter,
+                    invite_score,
+                    biz_type="invite_reward",
+                    biz_id=relation.id,
+                    biz_no=str(relation.id),
+                    idempotency_key=f"invite-reward:{relation.id}",
+                    remark=f"邀请用户 {user.user_no} 注册审核通过",
+                    expires_at=datetime.now() + timedelta(days=valid_days),
+                )
                 relation.score_granted = True
     await db.commit()
     await db.refresh(user)
@@ -926,15 +1181,41 @@ async def adjust_user_wallet(user_id: int, payload: WalletAdjustPayload, db: Asy
 
 
 @router.post("/users/{user_id}/points/adjust", response_model=AdminUserRow)
-async def adjust_user_points(user_id: int, payload: PointsAdjustPayload, db: AsyncSession = Depends(get_db)):
-    user = await db.scalar(select(UserAccount).where(UserAccount.id == user_id, UserAccount.role == "user").with_for_update())
-    if not user:
+async def adjust_user_points(
+    user_id: int,
+    payload: PointsAdjustPayload,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await PointService.lock_user(db, user_id)
+    if user.role != "user":
         raise HTTPException(status_code=404, detail="User not found")
-    before = int(user.points or 0)
-    after = before + payload.amount if payload.direction == "income" else before - payload.amount
-    if after < 0:
-        raise HTTPException(status_code=400, detail="Insufficient points")
-    user.points = after
+    adjustment_no = f"PA{datetime.now():%Y%m%d%H%M%S}{uuid4().hex[:8].upper()}"
+    if payload.direction == "income":
+        rule = await db.get(PointRule, 1)
+        valid_days = max(1, int(rule.valid_days if rule else 365))
+        await PointService.credit_locked(
+            db,
+            user,
+            payload.amount,
+            biz_type="admin_adjust",
+            biz_id=admin_user.id,
+            biz_no=adjustment_no,
+            idempotency_key=f"admin-points:{adjustment_no}",
+            remark=payload.remark or "平台增加积分",
+            expires_at=datetime.now() + timedelta(days=valid_days),
+        )
+    else:
+        await PointService.debit_locked(
+            db,
+            user,
+            payload.amount,
+            biz_type="admin_adjust",
+            biz_id=admin_user.id,
+            biz_no=adjustment_no,
+            idempotency_key=f"admin-points:{adjustment_no}",
+            remark=payload.remark or "平台扣减积分",
+        )
     await db.commit()
     await db.refresh(user)
     conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
@@ -1044,7 +1325,18 @@ async def backfill_local_image_assets(db: AsyncSession) -> None:
         object_key = file.relative_to(upload_root).as_posix()
         if object_key in known:
             continue
-        source = "admission_notice" if object_key.startswith("graduation/") else "support" if object_key.startswith("support/") else "common"
+        if object_key.startswith("graduation/"):
+            source = "student_card"
+        elif object_key.startswith("support-thumbs/"):
+            source = "support_thumb"
+        elif object_key.startswith("support/"):
+            source = "support"
+        elif object_key.startswith("contracts/"):
+            source = "contract_signature"
+        elif object_key.startswith("travel-reviews/"):
+            source = "travel_review"
+        else:
+            source = "common"
         db.add(
             UploadedAsset(
                 source=source,

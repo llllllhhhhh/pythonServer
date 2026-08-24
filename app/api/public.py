@@ -2,30 +2,51 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.cache import cache_get_json, cache_set_json
+from app.core.asset_access import is_public_asset_source, verify_asset_access_token
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.storage import load_upload_bytes
 from app.core.travel_match_settings import get_travel_match_settings
 from app.core.upload_settings import get_upload_setting
-from app.models import ContentArticle, DecorationConfig, PlatformAnnouncement, PointRule, PreferenceEvent, SchoolSite, TravelRoute, UploadedAsset
+from app.models import ContentArticle, DecorationConfig, PlatformAnnouncement, PointRule, PreferenceEvent, SchoolMerchantSession, SchoolSite, SupportConversation, TravelRoute, UploadedAsset, UserAccount, UserSession
 from app.schemas.api import AnnouncementOut, ArticleOut, PointRuleOut, PreferenceEventPayload, RouteOut, SchoolSiteOut
 
 router = APIRouter(prefix="/public", tags=["user-public"])
 PUBLIC_CONFIG_KEY = "xuetuxing:decoration:published"
-IMAGE_CACHE_HEADERS = {"Cache-Control": "public, max-age=2592000, immutable"}
+MIN_ONBOARDING_VERSION = 3
+PUBLIC_IMAGE_CACHE_HEADERS = {"Cache-Control": "public, max-age=2592000, immutable"}
+PRIVATE_IMAGE_CACHE_HEADERS = {"Cache-Control": "private, no-store", "Pragma": "no-cache"}
 
 
-def image_response(content: bytes, content_type: str, cache_key: str) -> Response:
+def image_response(content: bytes, content_type: str, cache_key: str, public: bool) -> Response:
     return Response(
         content=content,
         media_type=content_type,
-        headers={**IMAGE_CACHE_HEADERS, "ETag": f'"{cache_key}"'},
+        headers={
+            **(PUBLIC_IMAGE_CACHE_HEADERS if public else PRIVATE_IMAGE_CACHE_HEADERS),
+            "ETag": f'"{cache_key}"',
+        },
     )
+
+
+def normalize_public_config_content(content: dict | None) -> dict:
+    if not isinstance(content, dict):
+        return {}
+    normalized = dict(content)
+    onboarding = dict(normalized.get("onboarding") or {})
+    try:
+        current_version = int(onboarding.get("version") or 0)
+    except (TypeError, ValueError):
+        current_version = 0
+    if current_version < MIN_ONBOARDING_VERSION:
+        onboarding["version"] = MIN_ONBOARDING_VERSION
+    normalized["onboarding"] = onboarding
+    return normalized
 
 
 def build_thumbnail(content: bytes, max_width: int = 360) -> bytes | None:
@@ -33,18 +54,6 @@ def build_thumbnail(content: bytes, max_width: int = 360) -> bytes | None:
         from PIL import Image, ImageOps
     except Exception:
         return None
-
-
-async def load_upload_bytes_with_fallback(object_key: str, storage: str | None = None):
-    primary = (storage or settings.storage_driver).lower()
-    try:
-        return await load_upload_bytes(object_key, primary)
-    except Exception as original_error:
-        fallback = "obs" if primary != "obs" else "local"
-        try:
-            return await load_upload_bytes(object_key, fallback)
-        except Exception:
-            raise original_error
     try:
         with Image.open(BytesIO(content)) as image:
             image = ImageOps.exif_transpose(image)
@@ -64,6 +73,74 @@ async def load_upload_bytes_with_fallback(object_key: str, storage: str | None =
             return output.getvalue()
     except Exception:
         return None
+
+
+async def load_upload_bytes_with_fallback(object_key: str, storage: str | None = None):
+    primary = (storage or settings.storage_driver).lower()
+    try:
+        return await load_upload_bytes(object_key, primary)
+    except Exception as original_error:
+        fallback = "obs" if primary != "obs" else "local"
+        try:
+            return await load_upload_bytes(object_key, fallback)
+        except Exception:
+            raise original_error
+
+
+def _bearer_token(request: Request) -> str:
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+async def _authorize_asset(
+    asset: UploadedAsset,
+    request: Request,
+    db: AsyncSession,
+    variant: str,
+    asset_token: str,
+) -> bool:
+    if is_public_asset_source(asset.source):
+        return True
+    if verify_asset_access_token(asset.id, variant, asset_token):
+        return False
+
+    token = _bearer_token(request)
+    if token:
+        user_session = await db.get(UserSession, token)
+        if user_session and user_session.expires_at >= datetime.now():
+            user = await db.get(UserAccount, user_session.user_id)
+            if user and user.status == "active" and user.role == user_session.role:
+                if user.role == "admin" or (asset.user_id and asset.user_id == user.id):
+                    return False
+                if asset.conversation_id:
+                    conversation = await db.get(SupportConversation, asset.conversation_id)
+                    if conversation and conversation.user_id == user.user_no:
+                        return False
+
+        merchant_session = await db.get(SchoolMerchantSession, token)
+        if merchant_session and merchant_session.expires_at >= datetime.now() and asset.conversation_id:
+            conversation = await db.get(SupportConversation, asset.conversation_id)
+            if conversation and conversation.school_id == merchant_session.school_id:
+                school = await db.get(SchoolSite, merchant_session.school_id)
+                if school and school.status and school.review_status == "approved":
+                    return False
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Asset authorization required")
+
+
+async def _get_asset_by_object_key(db: AsyncSession, object_key: str) -> UploadedAsset:
+    clean_key = object_key.strip().lstrip("/")
+    if not clean_key or ".." in Path(clean_key).parts:
+        raise HTTPException(status_code=400, detail="Invalid asset path")
+    asset = await db.scalar(
+        select(UploadedAsset)
+        .where(UploadedAsset.object_key == clean_key)
+        .order_by(UploadedAsset.id.desc())
+    )
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return asset
 
 
 @router.get("/config")
@@ -87,7 +164,7 @@ async def published_config(
     payload = {
         "version": item.version,
         "published_at": item.published_at.isoformat() if item.published_at else None,
-        "content": item.content,
+        "content": normalize_public_config_content(item.content),
     }
     if not fresh:
         await cache_set_json(PUBLIC_CONFIG_KEY, payload, ttl=600)
@@ -231,57 +308,83 @@ async def record_preference(payload: PreferenceEventPayload, db: AsyncSession = 
 
 
 @router.get("/assets/{asset_id}/file")
-async def public_asset_file(asset_id: int, db: AsyncSession = Depends(get_db)):
+async def public_asset_file(
+    asset_id: int,
+    request: Request,
+    asset_token: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+):
     asset = await db.get(UploadedAsset, asset_id)
     if not asset:
         raise HTTPException(status_code=404, detail="图片不存在")
+    public = await _authorize_asset(asset, request, db, "file", asset_token)
     loaded = await load_upload_bytes_with_fallback(asset.object_key, asset.storage)
     cache_key = f"asset-{asset.id}-{asset.updated_at.timestamp() if asset.updated_at else asset.id}"
-    return image_response(loaded.content, loaded.content_type, cache_key)
+    return image_response(loaded.content, loaded.content_type, cache_key, public)
 
 
 @router.get("/assets/{asset_id}/thumb")
-async def public_asset_thumb(asset_id: int, db: AsyncSession = Depends(get_db)):
+async def public_asset_thumb(
+    asset_id: int,
+    request: Request,
+    asset_token: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+):
     asset = await db.get(UploadedAsset, asset_id)
     if not asset:
         raise HTTPException(status_code=404, detail="图片不存在")
+    public = await _authorize_asset(asset, request, db, "thumb", asset_token)
     cache_dir = Path(settings.upload_dir) / ".thumb-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{asset_id}.jpg"
     cache_key = f"thumb-{asset.id}-{asset.updated_at.timestamp() if asset.updated_at else asset.id}"
     if cache_file.exists():
-        return image_response(cache_file.read_bytes(), "image/jpeg", cache_key)
+        return image_response(cache_file.read_bytes(), "image/jpeg", cache_key, public)
     loaded = await load_upload_bytes_with_fallback(asset.object_key, asset.storage)
     thumb = build_thumbnail(loaded.content)
     if not thumb:
-        return image_response(loaded.content, loaded.content_type, cache_key)
+        return image_response(loaded.content, loaded.content_type, cache_key, public)
     cache_file.write_bytes(thumb)
-    return image_response(thumb, "image/jpeg", cache_key)
+    return image_response(thumb, "image/jpeg", cache_key, public)
 
 
 @router.get("/assets/object-thumb/{object_key:path}")
-async def public_asset_object_thumb(object_key: str):
+async def public_asset_object_thumb(
+    object_key: str,
+    request: Request,
+    asset_token: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+):
     suffix = object_key.rsplit(".", 1)[-1].lower() if "." in object_key else ""
     if suffix not in {"jpg", "jpeg", "png", "gif", "webp"}:
         raise HTTPException(status_code=400, detail="仅支持图片预览")
+    asset = await _get_asset_by_object_key(db, object_key)
+    public = await _authorize_asset(asset, request, db, "object-thumb", asset_token)
     cache_dir = Path(settings.upload_dir) / ".thumb-cache" / "objects"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{abs(hash(object_key))}.jpg"
     cache_key = f"object-thumb-{abs(hash(object_key))}"
     if cache_file.exists():
-        return image_response(cache_file.read_bytes(), "image/jpeg", cache_key)
-    loaded = await load_upload_bytes_with_fallback(object_key, "obs" if settings.storage_driver.lower() == "obs" else "local")
+        return image_response(cache_file.read_bytes(), "image/jpeg", cache_key, public)
+    loaded = await load_upload_bytes_with_fallback(asset.object_key, asset.storage)
     thumb = build_thumbnail(loaded.content)
     if not thumb:
-        return image_response(loaded.content, loaded.content_type, cache_key)
+        return image_response(loaded.content, loaded.content_type, cache_key, public)
     cache_file.write_bytes(thumb)
-    return image_response(thumb, "image/jpeg", cache_key)
+    return image_response(thumb, "image/jpeg", cache_key, public)
 
 
 @router.get("/assets/object/{object_key:path}")
-async def public_asset_object(object_key: str):
+async def public_asset_object(
+    object_key: str,
+    request: Request,
+    asset_token: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+):
     suffix = object_key.rsplit(".", 1)[-1].lower() if "." in object_key else ""
     if suffix not in {"jpg", "jpeg", "png", "gif", "webp"}:
         raise HTTPException(status_code=400, detail="仅支持图片预览")
-    loaded = await load_upload_bytes_with_fallback(object_key, "obs" if settings.storage_driver.lower() == "obs" else "local")
-    return image_response(loaded.content, loaded.content_type, f"object-{abs(hash(object_key))}")
+    asset = await _get_asset_by_object_key(db, object_key)
+    public = await _authorize_asset(asset, request, db, "object", asset_token)
+    loaded = await load_upload_bytes_with_fallback(asset.object_key, asset.storage)
+    return image_response(loaded.content, loaded.content_type, f"object-{asset.id}", public)

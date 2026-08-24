@@ -2,9 +2,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.asset_access import asset_api_url
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.core.storage import save_upload_bytes
@@ -23,7 +24,9 @@ async def my_graduation_certification(
     db: AsyncSession = Depends(get_db),
 ):
     return await db.scalar(
-        select(GraduationCertification).where(GraduationCertification.user_id == current_user.id)
+        select(GraduationCertification)
+        .where(GraduationCertification.user_id == current_user.id)
+        .with_for_update()
     )
 
 
@@ -32,7 +35,6 @@ async def submit_graduation_certification(
     real_name: str = Form(...),
     school_name: str = Form(...),
     major_name: str = Form(default=""),
-    graduation_date: str = Form(default=""),
     certificate_no: str = Form(default=""),
     file: UploadFile = File(...),
     current_user: UserAccount = Depends(get_current_user),
@@ -47,26 +49,26 @@ async def submit_graduation_certification(
 
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
-        raise HTTPException(status_code=400, detail="录取通知书仅支持 jpg、png、webp 图片")
+        raise HTTPException(status_code=400, detail="学生证仅支持 jpg、png、webp 图片")
     upload_setting = await get_upload_setting(db)
     max_file_size = upload_setting["max_image_bytes"]
     max_image_mb = upload_setting["max_image_mb"]
     content = await file.read(max_file_size + 1)
     if len(content) > max_file_size:
-        raise HTTPException(status_code=400, detail=f"录取通知书图片不能超过 {max_image_mb}MB")
+        raise HTTPException(status_code=400, detail=f"学生证图片不能超过 {max_image_mb}MB")
 
     item = await db.scalar(
         select(GraduationCertification).where(GraduationCertification.user_id == current_user.id)
     )
     if item and item.status == "pending":
-        raise HTTPException(status_code=400, detail="录取通知书正在审核中，请勿重复提交")
+        raise HTTPException(status_code=400, detail="学生证认证正在审核中，请勿重复提交")
     if not item:
         item = GraduationCertification(user_id=current_user.id)
         db.add(item)
 
     stored = await save_upload_bytes(content, file.filename, file.content_type, "graduation")
     asset = UploadedAsset(
-        source="admission_notice",
+        source="student_card",
         storage=stored.storage,
         bucket=stored.bucket,
         object_key=stored.object_key,
@@ -85,13 +87,22 @@ async def submit_graduation_certification(
     item.real_name = real_name
     item.school_name = school_name
     item.major_name = major_name.strip()[:120]
-    item.graduation_date = graduation_date.strip()[:20]
+    item.graduation_date = ""
     item.certificate_no = certificate_no.strip()[:80]
-    item.certificate_image = f"{settings.api_prefix}/public/assets/{asset.id}/file"
+    item.certificate_image = asset_api_url(asset.id)
     item.status = "pending"
     item.reject_reason = ""
     item.reviewed_by = None
     item.reviewed_at = None
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.scalar(
+            select(GraduationCertification).where(GraduationCertification.user_id == current_user.id)
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="学生证认证正在审核中，请勿重复提交")
+        raise
     await db.refresh(item)
     return item

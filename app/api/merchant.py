@@ -1,11 +1,13 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import generate_token, hash_password, session_expire_at, verify_password
+from app.core.auth import generate_token, hash_password, session_expire_at, verify_and_rehash_password
 from app.core.database import get_db
+from app.core.login_guard import clear_login_failures, ensure_login_allowed, record_login_failure
+from app.core.slider_captcha import consume_slider_ticket
 from app.models import SchoolMerchantSession, SchoolSite
 from app.schemas.api import (
     LoginPayload,
@@ -83,10 +85,21 @@ async def apply_school(payload: SchoolApplicationPayload, db: AsyncSession = Dep
 
 
 @router.post("/login", response_model=MerchantLoginResponse)
-async def merchant_login(payload: LoginPayload, db: AsyncSession = Depends(get_db)):
+async def merchant_login(payload: LoginPayload, request: Request, db: AsyncSession = Depends(get_db)):
+    login_key = await ensure_login_allowed("merchant", payload.account, request)
+    await consume_slider_ticket(db, payload.slider_ticket, "merchant")
     school = await db.scalar(select(SchoolSite).where(SchoolSite.merchant_account == payload.account))
-    if not school or not school.merchant_password_hash or not verify_password(payload.password, school.merchant_password_hash):
+    valid_password, upgraded_hash = (
+        verify_and_rehash_password(payload.password, school.merchant_password_hash)
+        if school and school.merchant_password_hash
+        else (False, None)
+    )
+    if not school or not valid_password:
+        await record_login_failure(login_key)
         raise HTTPException(status_code=401, detail="商户账号或密码错误")
+    await clear_login_failures(login_key)
+    if upgraded_hash:
+        school.merchant_password_hash = upgraded_hash
     if school.review_status == "pending":
         raise HTTPException(status_code=403, detail="入驻申请正在审核中")
     if school.review_status == "rejected":

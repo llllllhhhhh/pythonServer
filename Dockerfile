@@ -12,6 +12,8 @@ RUN python -m pip install --upgrade pip && \
     -i ${PIP_INDEX_URL} \
     --trusted-host ${PIP_TRUSTED_HOST} \
     -r requirements.txt
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 COPY app ./app
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

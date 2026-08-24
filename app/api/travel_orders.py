@@ -1,15 +1,17 @@
 import base64
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from sqlalchemy import desc, or_, select
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile, status
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from app.api.merchant import get_current_school
 from app.core.config import settings
+from app.core.asset_access import asset_api_url
 from app.core.contract_settings import get_contract_template
 from app.core.database import get_db
 from app.core.order_status import TravelContractStatus, TravelFulfillmentStatus
@@ -18,11 +20,19 @@ from app.core.snowflake import SnowflakeGenerator
 from app.core.storage import save_upload_bytes
 from app.core.upload_settings import get_upload_setting
 from app.models import ContractTemplateSnapshot, SchoolSite, TravelOrder, TravelRoute, TravelRouteReview, UploadedAsset, UserAccount
+from app.services.point_service import PointService
+from app.services.travel_order_service import (
+    add_travel_audit,
+    add_verification_record,
+    cancel_travel_order,
+    qr_expiry,
+)
 from app.schemas.api import (
     ContractSignPayload,
     ContractTemplateOut,
     OrderOut,
     RouteExchangePayload,
+    TravelOrderCancelPayload,
     TravelRouteReviewCreate,
     TravelRouteReviewEligibilityOut,
     TravelRouteReviewListOut,
@@ -32,11 +42,6 @@ from app.schemas.api import (
 
 router = APIRouter(tags=["travel-orders"])
 snowflake = SnowflakeGenerator(settings.snowflake_worker_id, settings.snowflake_datacenter_id)
-
-
-def _phone_tail(phone: str) -> str:
-    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
-    return digits[-4:] if len(digits) >= 4 else digits
 
 
 async def _save_contract_signature(
@@ -73,31 +78,27 @@ async def _save_contract_signature(
     if len(content) > 500_000:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Signature image is too large")
     stored = await save_upload_bytes(content, f"{order_no}-signature{suffix}", mime, "contracts/signatures")
-    db.add(
-        UploadedAsset(
-            source="contract_signature",
-            storage=stored.storage,
-            bucket=stored.bucket,
-            object_key=stored.object_key,
-            path=stored.path,
-            url=stored.url,
-            filename=f"{order_no}-signature{suffix}",
-            original_name=f"{order_no}-signature{suffix}",
-            mime_type=mime,
-            size=len(content),
-            uploader_role="user",
-            user_id=user_id,
-        )
+    asset = UploadedAsset(
+        source="contract_signature",
+        storage=stored.storage,
+        bucket=stored.bucket,
+        object_key=stored.object_key,
+        path=stored.path,
+        url=stored.url,
+        filename=f"{order_no}-signature{suffix}",
+        original_name=f"{order_no}-signature{suffix}",
+        mime_type=mime,
+        size=len(content),
+        uploader_role="user",
+        user_id=user_id,
     )
-    return stored.url
+    db.add(asset)
+    await db.flush()
+    return asset_api_url(asset.id)
 
 
 def _travel_order_owned_by(item: TravelOrder, user: UserAccount) -> bool:
-    return (
-        item.user_id == user.id
-        or item.user_no == user.user_no
-        or (_phone_tail(item.phone) and _phone_tail(item.phone) == _phone_tail(user.phone))
-    )
+    return bool(item.user_id and item.user_id == user.id)
 
 
 def normalize_fulfillment_status(item: TravelOrder) -> None:
@@ -146,9 +147,35 @@ async def attach_contract_snapshots(db: AsyncSession, orders: list[TravelOrder])
     return orders
 
 
+async def attach_contract_signature_assets(db: AsyncSession, orders: list[TravelOrder]) -> None:
+    legacy_keys: dict[int, str] = {}
+    for item in orders:
+        url = str(item.contract_signature_url or "").strip()
+        if url.startswith("/uploads/"):
+            legacy_keys[item.id] = url.removeprefix("/uploads/")
+        elif url.startswith("http://") or url.startswith("https://"):
+            legacy_keys[item.id] = urlsplit(url).path.lstrip("/")
+    if not legacy_keys:
+        return
+    assets = list(
+        await db.scalars(
+            select(UploadedAsset).where(
+                UploadedAsset.source == "contract_signature",
+                UploadedAsset.object_key.in_(set(legacy_keys.values())),
+            )
+        )
+    )
+    by_key = {asset.object_key: asset for asset in assets}
+    for item in orders:
+        asset = by_key.get(legacy_keys.get(item.id, ""))
+        if asset:
+            item.contract_signature_url = asset_api_url(asset.id)
+
+
 async def attach_travel_order_details(db: AsyncSession, orders: list[TravelOrder]) -> list[TravelOrder]:
     await attach_route_images(db, orders)
     await attach_contract_snapshots(db, orders)
+    await attach_contract_signature_assets(db, orders)
     for item in orders:
         for field in (
             "cover",
@@ -182,21 +209,15 @@ async def _get_my_travel_order(db: AsyncSession, order_id: int, user: UserAccoun
 
 
 async def _my_route_orders(db: AsyncSession, route_id: int, user: UserAccount) -> list[TravelOrder]:
-    phone_tail = _phone_tail(user.phone)
     query = (
         select(TravelOrder)
         .where(
             TravelOrder.route_id == route_id,
-            or_(
-                TravelOrder.user_id == user.id,
-                TravelOrder.user_no == user.user_no,
-                TravelOrder.phone.like(f"%{phone_tail}") if phone_tail else TravelOrder.id == -1,
-            ),
+            TravelOrder.user_id == user.id,
         )
         .order_by(desc(TravelOrder.created_at), desc(TravelOrder.id))
     )
-    rows = list(await db.scalars(query))
-    return [item for item in rows if _travel_order_owned_by(item, user)]
+    return list(await db.scalars(query))
 
 
 async def _review_eligible_order(db: AsyncSession, route_id: int, user: UserAccount) -> tuple[list[TravelOrder], set[int], TravelOrder | None]:
@@ -210,7 +231,14 @@ async def _review_eligible_order(db: AsyncSession, route_id: int, user: UserAcco
             )
         )
     )
-    eligible = next((item for item in orders if item.id not in reviewed_order_ids), None)
+    eligible = next(
+        (
+            item
+            for item in orders
+            if item.fulfillment_status == TravelFulfillmentStatus.COMPLETED and item.id not in reviewed_order_ids
+        ),
+        None,
+    )
     return orders, reviewed_order_ids, eligible
 
 
@@ -219,16 +247,13 @@ async def my_travel_orders(
     current_user: UserAccount = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[TravelOrder]:
-    phone_tail = _phone_tail(current_user.phone)
-    query = select(TravelOrder).where(
-        or_(
-            TravelOrder.user_id == current_user.id,
-            TravelOrder.user_no == current_user.user_no,
-            TravelOrder.phone.like(f"%{phone_tail}") if phone_tail else TravelOrder.id == -1,
+    visible = list(
+        await db.scalars(
+            select(TravelOrder)
+            .where(TravelOrder.user_id == current_user.id)
+            .order_by(desc(TravelOrder.created_at), desc(TravelOrder.id))
         )
-    ).order_by(desc(TravelOrder.created_at), desc(TravelOrder.id))
-    rows = list(await db.scalars(query))
-    visible = [item for item in rows if _travel_order_owned_by(item, current_user)]
+    )
     changed = False
     for item in visible:
         before = item.fulfillment_status
@@ -284,7 +309,13 @@ async def route_review_eligibility(
     return {
         "route_id": route_id,
         "can_review": False,
-        "reason": "already_reviewed" if orders else "not_exchanged",
+        "reason": (
+            "not_exchanged"
+            if not orders
+            else "already_reviewed"
+            if any(item.fulfillment_status == TravelFulfillmentStatus.COMPLETED for item in orders)
+            else "trip_not_completed"
+        ),
         "eligible_order_id": 0,
         "eligible_order_no": "",
         "reviewed_order_ids": list(reviewed_order_ids),
@@ -311,9 +342,13 @@ async def create_route_review(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="评价订单不属于当前用户")
         if order.id in reviewed_order_ids:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该兑换订单已经评价过")
+        if order.fulfillment_status != TravelFulfillmentStatus.COMPLETED:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="行程完成后才能评价")
     else:
         order = eligible
     if not order:
+        if any(item.fulfillment_status != TravelFulfillmentStatus.COMPLETED for item in orders):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="行程完成后才能评价")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该路线已评价过")
     images = [str(item).strip() for item in payload.images if str(item).strip()][:6]
     review = TravelRouteReview(
@@ -351,6 +386,8 @@ async def upload_route_review_image(
     orders, _, _ = await _review_eligible_order(db, route_id, current_user)
     if not orders:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="兑换该路线后才能上传评价图片")
+    if not any(item.fulfillment_status == TravelFulfillmentStatus.COMPLETED for item in orders):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="行程完成后才能上传评价图片")
     suffix = Path(file.filename or "").suffix.lower() or ".jpg"
     if suffix not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="仅支持 jpg/png/gif/webp 图片")
@@ -377,7 +414,7 @@ async def upload_route_review_image(
     )
     db.add(asset)
     await db.flush()
-    public_url = f"{settings.api_prefix}/public/assets/{asset.id}/file"
+    public_url = asset_api_url(asset.id)
     await db.commit()
     return {"url": public_url, "path": public_url, "storage": stored.storage}
 
@@ -425,9 +462,31 @@ async def travel_contract_template(
 async def exchange_travel_route(
     route_id: int,
     payload: RouteExchangePayload,
+    idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=120),
     current_user: UserAccount = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TravelOrder:
+    idempotency_key = idempotency_key.strip()
+    existing = await db.scalar(
+        select(TravelOrder).where(
+            TravelOrder.user_id == current_user.id,
+            TravelOrder.idempotency_key == idempotency_key,
+        )
+    )
+    if existing:
+        await attach_travel_order_details(db, [existing])
+        return existing
+
+    locked_user = await PointService.lock_user(db, current_user.id)
+    existing = await db.scalar(
+        select(TravelOrder).where(
+            TravelOrder.user_id == locked_user.id,
+            TravelOrder.idempotency_key == idempotency_key,
+        )
+    )
+    if existing:
+        await attach_travel_order_details(db, [existing])
+        return existing
     route = await db.scalar(
         select(TravelRoute)
         .where(
@@ -441,19 +500,7 @@ async def exchange_travel_route(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found or offline")
     if int(route.stock or 0) <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Route stock is not enough")
-    locked_user = await db.scalar(
-        select(UserAccount)
-        .where(UserAccount.id == current_user.id)
-        .with_for_update()
-    )
-    if not locked_user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Please login first")
     required_points = int(route.price or 0)
-    if int(locked_user.points or 0) < required_points:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Insufficient points")
-
-    locked_user.points = int(locked_user.points or 0) - required_points
-    route.stock = int(route.stock or 0) - 1
     order = TravelOrder(
         order_no=snowflake.next_order_no("TR"),
         user_id=locked_user.id,
@@ -467,12 +514,48 @@ async def exchange_travel_route(
         agency=route.agency,
         amount_text=f"{required_points} 积分",
         cover=route.image or "",
+        idempotency_key=idempotency_key,
+        points_cost=required_points,
         status=0,
         contract_status=TravelContractStatus.UNSIGNED,
         fulfillment_status=TravelFulfillmentStatus.CONTRACT_PENDING,
     )
     db.add(order)
-    await db.commit()
+    try:
+        await db.flush()
+        if required_points > 0:
+            await PointService.debit_locked(
+                db,
+                locked_user,
+                required_points,
+                biz_type="travel_exchange",
+                biz_id=order.id,
+                biz_no=order.order_no,
+                idempotency_key=f"travel-exchange:{order.order_no}",
+                remark=f"兑换旅行路线：{route.name}",
+            )
+        route.stock = int(route.stock or 0) - 1
+        add_travel_audit(
+            db,
+            order,
+            event_type="order_created",
+            to_status=TravelFulfillmentStatus.CONTRACT_PENDING,
+            actor=locked_user,
+            evidence={"route_id": route.id, "points_cost": required_points},
+        )
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.scalar(
+            select(TravelOrder).where(
+                TravelOrder.user_id == current_user.id,
+                TravelOrder.idempotency_key == idempotency_key,
+            )
+        )
+        if existing:
+            await attach_travel_order_details(db, [existing])
+            return existing
+        raise
     await db.refresh(order)
     await attach_travel_order_details(db, [order])
     return order
@@ -488,11 +571,18 @@ async def sign_travel_contract(
     item = await _get_my_travel_order(db, order_id, current_user)
     if item.contract_status == TravelContractStatus.APPROVED:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Contract already approved")
+    if item.fulfillment_status not in {
+        TravelFulfillmentStatus.CONTRACT_PENDING,
+        TravelFulfillmentStatus.CONTRACT_REVIEWING,
+        TravelFulfillmentStatus.CONTRACT_REJECTED,
+    }:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Contract can no longer be signed")
     template = await get_contract_template(db)
     item.user_id = current_user.id
     item.user_no = current_user.user_no
     item.user_name = current_user.nickname or payload.signer_name.strip()
     item.phone = current_user.phone or payload.signer_phone.strip()
+    previous_status = str(item.contract_status or "")
     item.contract_status = TravelContractStatus.PENDING
     item.fulfillment_status = TravelFulfillmentStatus.CONTRACT_REVIEWING
     item.contract_signer_name = payload.signer_name.strip()
@@ -506,6 +596,19 @@ async def sign_travel_contract(
     item.contract_signed_at = datetime.now()
     item.contract_reviewed_at = None
     item.contract_reject_reason = ""
+    add_travel_audit(
+        db,
+        item,
+        event_type="contract_signed",
+        from_status=previous_status,
+        to_status=TravelContractStatus.PENDING,
+        actor=current_user,
+        evidence={
+            "contract_template_version": item.contract_template_version,
+            "contract_template_snapshot_id": item.contract_template_snapshot_id,
+            "signature_url": item.contract_signature_url,
+        },
+    )
     await db.commit()
     await db.refresh(item)
     await attach_travel_order_details(db, [item])
@@ -522,11 +625,10 @@ async def submit_travel_pickup_info(
     item = await _get_my_travel_order(db, order_id, current_user)
     if item.contract_status != TravelContractStatus.APPROVED:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Contract must be approved before pickup information")
-    if item.fulfillment_status in {
-        TravelFulfillmentStatus.CHECKED_IN,
-        TravelFulfillmentStatus.IN_TRIP,
-        TravelFulfillmentStatus.COMPLETED,
-        TravelFulfillmentStatus.CANCELLED,
+    if item.fulfillment_status not in {
+        TravelFulfillmentStatus.INFO_PENDING,
+        TravelFulfillmentStatus.INFO_SUBMITTED,
+        TravelFulfillmentStatus.PICKUP_CONFIRMED,
     }:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pickup information can no longer be changed")
     item.pickup_address = payload.pickup_address.strip()
@@ -536,10 +638,20 @@ async def submit_travel_pickup_info(
     item.emergency_phone = payload.emergency_phone.strip()
     item.luggage_count = payload.luggage_count
     item.pickup_note = payload.pickup_note.strip()
+    previous_status = str(item.fulfillment_status or "")
     item.fulfillment_status = TravelFulfillmentStatus.INFO_SUBMITTED
     item.pickup_confirmed_at = None
     item.qr_token = ""
     item.qr_issued_at = None
+    item.qr_expires_at = None
+    add_travel_audit(
+        db,
+        item,
+        event_type="pickup_info_submitted",
+        from_status=previous_status,
+        to_status=TravelFulfillmentStatus.INFO_SUBMITTED,
+        actor=current_user,
+    )
     await db.commit()
     await db.refresh(item)
     await attach_travel_order_details(db, [item])
@@ -557,12 +669,48 @@ async def confirm_travel_pickup(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Contract has not been approved")
     if item.fulfillment_status != TravelFulfillmentStatus.PICKUP_CONFIRMED:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pickup schedule has not been confirmed")
+    previous_status = str(item.fulfillment_status or "")
     item.fulfillment_status = TravelFulfillmentStatus.USER_CONFIRMED
     item.pickup_confirmed_at = datetime.now()
     if not item.qr_token:
         item.qr_token = uuid4().hex
         item.qr_issued_at = datetime.now()
+        item.qr_expires_at = qr_expiry(item.travel_date)
+        add_verification_record(
+            db,
+            item,
+            action="issued",
+            token=item.qr_token,
+            result="success",
+            operator=current_user,
+        )
+    add_travel_audit(
+        db,
+        item,
+        event_type="pickup_confirmed_by_user",
+        from_status=previous_status,
+        to_status=TravelFulfillmentStatus.USER_CONFIRMED,
+        actor=current_user,
+        evidence={"qr_expires_at": item.qr_expires_at.isoformat() if item.qr_expires_at else ""},
+    )
     await db.commit()
     await db.refresh(item)
+    await attach_travel_order_details(db, [item])
+    return item
+
+
+@router.patch("/travel/orders/{order_id}/cancel", response_model=OrderOut)
+async def cancel_my_travel_order(
+    order_id: int,
+    payload: TravelOrderCancelPayload,
+    current_user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TravelOrder:
+    item = await cancel_travel_order(
+        db,
+        order_id,
+        actor=current_user,
+        reason=payload.reason,
+    )
     await attach_travel_order_details(db, [item])
     return item

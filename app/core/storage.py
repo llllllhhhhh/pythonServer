@@ -82,11 +82,10 @@ async def _put_obs_object(content: bytes, object_key: str, content_type: str) ->
     canonical_headers = (
         f"content-type:{content_type}\n"
         f"host:{host}\n"
-        "x-amz-acl:public-read\n"
         f"x-amz-content-sha256:{payload_hash}\n"
         f"x-amz-date:{amz_date}\n"
     )
-    signed_headers = "content-type;host;x-amz-acl;x-amz-content-sha256;x-amz-date"
+    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
     canonical_request = "\n".join(
         ["PUT", canonical_uri, "", canonical_headers, signed_headers, payload_hash]
     )
@@ -107,7 +106,6 @@ async def _put_obs_object(content: bytes, object_key: str, content_type: str) ->
     headers = {
         "Content-Type": content_type,
         "Host": host,
-        "x-amz-acl": "public-read",
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
         "Authorization": (
@@ -119,9 +117,7 @@ async def _put_obs_object(content: bytes, object_key: str, content_type: str) ->
     async with httpx.AsyncClient(timeout=40) as client:
         response = await client.put(url, content=content, headers=headers)
     response.raise_for_status()
-    public_base = settings.obs_public_base_url.rstrip("/")
-    public_url = f"{public_base}/{object_key}" if public_base else url
-    return StoredFile(url=public_url, path=public_url, storage="obs", bucket=bucket, object_key=object_key)
+    return StoredFile(url="", path=object_key, storage="obs", bucket=bucket, object_key=object_key)
 
 
 async def _get_obs_object(object_key: str) -> LoadedFile:
@@ -200,8 +196,7 @@ async def save_upload_bytes(
     target = Path(settings.upload_dir) / object_key
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
-    relative_path = f"/uploads/{object_key}"
-    return StoredFile(url=relative_path, path=relative_path, storage="local", bucket="", object_key=object_key)
+    return StoredFile(url="", path=object_key, storage="local", bucket="", object_key=object_key)
 
 
 async def load_upload_bytes(object_key: str, storage: str | None = None) -> LoadedFile:

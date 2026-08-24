@@ -54,10 +54,18 @@ MYSQL_USER=xuetuxing
 MYSQL_PASSWORD=你的数据库密码
 MYSQL_DATABASE=xuetuxing
 
+# Docker Compose 数据库使用独立变量，避免与上面的本机连接串用
+COMPOSE_MYSQL_ROOT_PASSWORD=容器数据库root强密码
+COMPOSE_MYSQL_USER=xuetuxing
+COMPOSE_MYSQL_PASSWORD=容器数据库应用账号强密码
+COMPOSE_MYSQL_DATABASE=xuetuxing
+
 REDIS_ENABLED=true
 REDIS_URL=redis://127.0.0.1:6379/0
 
-CORS_ORIGINS=http://localhost:5178,http://127.0.0.1:5178,http://113.44.149.128
+CORS_ORIGINS=http://localhost:5178,http://127.0.0.1:5178
+# 仅信任实际 Nginx / 负载均衡器的 IP 或 CIDR
+TRUSTED_PROXY_IPS=127.0.0.1,::1
 
 STORAGE_DRIVER=obs
 OBS_ACCESS_KEY=你的华为云 OBS Access Key Id
@@ -68,7 +76,7 @@ OBS_ENDPOINT=obs.cn-north-4.myhuaweicloud.com
 OBS_PUBLIC_BASE_URL=https://xuetuxing.obs.cn-north-4.myhuaweicloud.com
 ```
 
-只需要先创建 MySQL 数据库 `xuetuxing`，业务表会在后端启动时自动创建和升级。
+先创建 MySQL 数据库 `xuetuxing`，再执行 Alembic。API 启动时不会建表或改表；数据库不是当前版本时会拒绝启动。
 
 ## Windows 本地启动
 
@@ -77,6 +85,8 @@ cd outputs\xuetuxingServer
 python -m venv .venv
 .venv\Scripts\activate
 python -m pip install -r requirements.txt
+python -m app.db_migrate
+python -m alembic check
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -96,6 +106,8 @@ cd /root/pythonServer
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+python -m app.db_migrate
+python -m alembic check
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -125,15 +137,52 @@ sudo systemctl start xuetuxing-api
 sudo systemctl status xuetuxing-api
 ```
 
+非 Docker 部署还必须单独托管 RQ Worker。保存为 `/etc/systemd/system/xuetuxing-worker.service`：
+
+```ini
+[Unit]
+Description=Xuetuxing RQ Worker
+After=network.target mysql.service redis-server.service
+Requires=redis-server.service
+
+[Service]
+WorkingDirectory=/root/pythonServer
+EnvironmentFile=/root/pythonServer/.env
+ExecStart=/root/pythonServer/.venv/bin/rq worker --with-scheduler --url redis://127.0.0.1:6379/0 xuetuxing-orders
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now xuetuxing-worker
+sudo systemctl status xuetuxing-worker
+```
+
 ## Docker 部署
+
+Compose 会按顺序启动 MySQL/Redis、执行一次性 `migrate` 容器，再启动 API 和 RQ Worker。`migrate` 必须以退出码 0 结束，API 才会启动。
+
+如果 API 前面有 Nginx 或负载均衡器，需要在 `.env` 的 `TRUSTED_PROXY_IPS` 中填写该代理连接 API 时使用的真实源 IP/CIDR。Nginx 与 API 都在宿主机时通常为 `127.0.0.1,::1`；代理位于 Docker 网络时填写对应网段，例如 `172.20.0.0/16`。禁止配置 `0.0.0.0/0`，否则客户端可伪造转发头绕过登录限流。
 
 服务器能访问 Docker Hub 时：
 
 ```bash
 docker compose up -d --build
-docker compose ps
-docker compose logs -f api
+docker compose ps -a
+docker compose logs -f api worker
 ```
+
+正常状态应满足：
+
+- `migrate` 为 `Exited (0)`。
+- `mysql`、`redis`、`api` 为 `healthy`。
+- `worker` 为 `Up`，`rq info` 能看到监听 `xuetuxing-orders` 的 Worker。
+
+如果数据库来自没有 `alembic_version` 的旧版本，必须先做完整备份。开发环境会自动接管受支持的旧结构；生产环境需要临时设置 `ALLOW_LEGACY_SCHEMA_ADOPTION=true` 完成一次迁移，确认 `alembic check` 通过后立即恢复为 `false`。含未知表或不符合旧版结构指纹的数据库会被拒绝，不会被盲目标记为最新版本。
 
 服务器不能拉镜像时，在本地先保存镜像：
 
@@ -215,17 +264,23 @@ sudo systemctl reload nginx
 - Swagger：`http://127.0.0.1:8000/docs`
 - 线上健康检查：`http://113.44.149.128/health`
 
-默认管理账号：
+生产环境不会自动创建账号。仅本地开发需要演示数据时显式执行：
+
+```bash
+python -m app.cli seed-development --admin-password "仅限本地的测试密码"
+```
+
+开发 seed 默认创建的管理账号：
 
 - 账号：`13800000000`
 - 密码：`admin123456`
 
-演示用户：
+开发 seed 创建的演示用户：
 
 - 账号：`17600008032`
 - 密码：`12345678`
 
-正式环境必须修改默认管理员密码和 `ADMIN_API_KEY`。
+生产环境使用 `python -m app.cli bootstrap-admin` 显式创建首个管理员，且不得运行 `seed-development`。管理接口只接受管理员登录会话，不支持固定 `ADMIN_API_KEY` 旁路。
 
 ## 核心功能接口
 
@@ -347,11 +402,14 @@ proxy_set_header Connection "upgrade";
 
 - `.env` 中 `STORAGE_DRIVER=obs`
 - OBS AK/SK、桶名、区域正确
-- 桶 ACL 或后端代理接口能读取图片
-- 管理端和用户端使用后端 `/api/v1/public/assets/...` 代理地址展示图片
+- 桶和私密对象保持私有 ACL
+- 公开封面使用允许公开的资源来源；合同、签名、客服附件通过后端鉴权或短期签名 URL 读取
 
 ## 代码检查
 
 ```bash
-python -m py_compile app/main.py app/api/*.py app/models/entities.py app/core/database.py
+python -m compileall -q app tests
+python -m unittest discover -s tests -v
+python -m alembic check
+docker compose config --quiet
 ```

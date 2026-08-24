@@ -4,8 +4,8 @@ from datetime import datetime
 from sqlalchemy import select
 
 from app.core.auth import generate_user_no, hash_password
-from app.core.config import settings
 from app.core.database import SessionLocal
+from app.services.point_service import PointService
 from app.models import (
     ContentArticle,
     DecorationConfig,
@@ -83,6 +83,51 @@ DEFAULT_DECORATION = {
         "monthlyStock": 50,
         "enabled": True,
     },
+    "onboarding": {
+        "enabled": True,
+        "version": 3,
+        "eyebrow": "个性化学习向导",
+        "title": "先认识你，再推荐更合适的内容",
+        "description": "用 4 个简单问题建立学习画像，后续课程、资料和顾问服务会更贴近你的目标。",
+        "completionText": "完成并开启学徒行",
+        "allowSkip": False,
+        "heroImage": "https://images.unsplash.com/photo-1523240795612-9a054b0db644?w=1200",
+        "steps": [
+            {
+                "key": "stage",
+                "type": "single",
+                "required": True,
+                "title": "你目前处于哪个学习阶段？",
+                "description": "我们会据此安排学习节奏与内容难度",
+                "options": ["大一在读", "大二在读", "大三在读", "大四在读", "已毕业，准备考试", "在职备考"],
+            },
+            {
+                "key": "target",
+                "type": "single",
+                "required": True,
+                "title": "你的目标考试时间是？",
+                "description": "目标时间用于生成阶段计划，之后可在学习中心修改",
+                "options": ["2026 年 12 月", "2027 年 12 月", "2028 年 12 月", "暂未确定"],
+            },
+            {
+                "key": "schoolMajorStatus",
+                "type": "single",
+                "required": True,
+                "title": "院校和专业确认了吗？",
+                "description": "我们会根据确认进度推荐择校、择专业或备考内容",
+                "options": ["只确认了专业", "只确认了院校", "院校和专业都确认了", "都还没有确认"],
+            },
+            {
+                "key": "interests",
+                "type": "multiple",
+                "required": True,
+                "max": 3,
+                "title": "你重点关注哪些学科？",
+                "description": "最多选择 3 项，用于优化学习内容和服务推荐",
+                "options": ["考研数学", "计算机", "人工智能", "电子信息", "电气工程", "机械工程", "经管", "法学", "教育学", "医药化工", "其他专业"],
+            },
+        ],
+    },
 }
 
 
@@ -104,8 +149,10 @@ def normalize_points_text(value):
     )
 
 
-async def seed_data() -> None:
+async def seed_data(admin_phone: str, admin_password: str, admin_nickname: str) -> None:
     async with SessionLocal() as db:
+        created_user1 = False
+        created_user2 = False
         if not await db.get(PointRule, 1):
             db.add(PointRule(id=1))
         if not await db.scalar(select(DecorationConfig.id).limit(1)):
@@ -116,9 +163,9 @@ async def seed_data() -> None:
             db.add(
                 UserAccount(
                     user_no="ADMIN001",
-                    phone=settings.default_admin_phone,
-                    nickname=settings.default_admin_nickname,
-                    password_hash=hash_password(settings.default_admin_password),
+                    phone=admin_phone,
+                    nickname=admin_nickname,
+                    password_hash=hash_password(admin_password),
                     role="admin",
                     status="active",
                     is_registered=True,
@@ -127,29 +174,51 @@ async def seed_data() -> None:
 
         user1 = await db.scalar(select(UserAccount).where(UserAccount.phone == "17600008032"))
         if not user1:
+            created_user1 = True
             user1 = UserAccount(
                 user_no=generate_user_no(),
                 phone="17600008032",
                 nickname="林晓雪",
                 password_hash=hash_password("12345678"),
-                points=68,
+                points=0,
                 exam_status="备考中",
             )
             db.add(user1)
 
         user2 = await db.scalar(select(UserAccount).where(UserAccount.phone == "13900002177"))
         if not user2:
+            created_user2 = True
             user2 = UserAccount(
                 user_no=generate_user_no(),
                 phone="13900002177",
                 nickname="陈泽宇",
                 password_hash=hash_password("12345678"),
-                points=36,
+                points=0,
                 exam_status="备考中",
             )
             db.add(user2)
 
         await db.flush()
+        if created_user1:
+            await PointService.credit_locked(
+                db,
+                user1,
+                68,
+                biz_type="development_seed",
+                biz_no=user1.user_no,
+                idempotency_key=f"development-seed:{user1.id}",
+                remark="开发演示积分",
+            )
+        if created_user2:
+            await PointService.credit_locked(
+                db,
+                user2,
+                36,
+                biz_type="development_seed",
+                biz_no=user2.user_no,
+                idempotency_key=f"development-seed:{user2.id}",
+                remark="开发演示积分",
+            )
 
         if not await db.scalar(select(TravelRoute.id).limit(1)):
             db.add_all(
@@ -192,23 +261,26 @@ async def seed_data() -> None:
                 [
                     TravelOrder(
                         order_no="TS20260621008",
+                        idempotency_key="development-seed:TS20260621008",
                         user_id=user1.id,
                         user_no=user1.user_no,
                         cover="https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?w=700",
-                        order_type="积分兑换",
+                        order_type="points_exchange",
                         title="泰山经典游 2天1夜",
                         user_name="林晓雪",
                         phone="176****8032",
                         travel_date="2026-07-06",
                         agency="齐鲁文旅",
                         amount_text="100 积分",
+                        points_cost=100,
                     ),
                     TravelOrder(
                         order_no="DZ20260621016",
+                        idempotency_key="development-seed:DZ20260621016",
                         user_id=user2.id,
                         user_no=user2.user_no,
                         cover="https://images.unsplash.com/photo-1464278533981-50106e6176b1?w=700",
-                        order_type="人工定制",
+                        order_type="custom_travel",
                         title="川西雪山深度定制",
                         user_name="陈泽宇",
                         phone="139****2177",
@@ -298,7 +370,7 @@ async def seed_data() -> None:
                         title="隐私政策",
                         slug="privacy-policy",
                         summary="说明平台如何收集、使用和保护手机号、客服记录、认证资料等信息。",
-                        content="学徒行重视你的隐私与信息安全。\n\n1. 我们会根据功能需要收集手机号、昵称、学习偏好、订单信息、客服聊天记录和录取通知书认证资料。\n2. 上述信息主要用于账号识别、注册审核、积分发放、客服沟通、订单预约和权益认证。\n3. 录取通知书等敏感图片仅用于认证审核，不会用于无关用途。\n4. 你可以通过客服或平台提供的功能申请修改密码、注销账号或咨询个人信息处理情况。\n5. 我们会采取合理安全措施保护数据，但请你也妥善保管账号密码。",
+                        content="学徒行重视你的隐私与信息安全。\n\n1. 我们会根据功能需要收集手机号、昵称、学习偏好、订单信息、客服聊天记录和学生证认证资料。\n2. 上述信息主要用于账号识别、注册审核、积分发放、客服沟通、订单预约和权益认证。\n3. 学生证等敏感图片仅用于认证审核，不会用于无关用途。\n4. 你可以通过客服或平台提供的功能申请修改密码、注销账号或咨询个人信息处理情况。\n5. 我们会采取合理安全措施保护数据，但请你也妥善保管账号密码。",
                         category="协议规则",
                         pinned=True,
                         status=True,
@@ -386,6 +458,13 @@ async def seed_data() -> None:
 
         for decoration in list(await db.scalars(select(DecorationConfig))):
             decoration.content = normalize_points_text(decoration.content)
+            onboarding = decoration.content.setdefault("onboarding", {})
+            try:
+                onboarding_version = int(onboarding.get("version") or 0)
+            except (TypeError, ValueError):
+                onboarding_version = 0
+            if onboarding_version < DEFAULT_DECORATION["onboarding"]["version"]:
+                onboarding["version"] = DEFAULT_DECORATION["onboarding"]["version"]
         for order in list(await db.scalars(select(TravelOrder))):
             order.amount_text = normalize_points_text(order.amount_text)
             if not order.user_id:

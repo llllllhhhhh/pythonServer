@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from app.core.order_status import COMMERCE_PAYMENT_STATUS_TEXT, status_label
 
@@ -78,3 +78,26 @@ class StudyOrderOut(BaseModel):
 class LearningProfileUpdate(BaseModel):
     target_exam: str = Field(default="待设置", max_length=80)
     current_stage: str = Field(default="基础阶段", max_length=80)
+
+
+class LearningOnboardingUpdate(BaseModel):
+    version: int = Field(ge=1, le=100000)
+    answers: dict[str, str | list[str]] = Field(default_factory=dict)
+
+    @field_validator("answers")
+    @classmethod
+    def validate_answers(cls, value: dict[str, str | list[str]]):
+        if len(value) > 20:
+            raise ValueError("Too many onboarding answers")
+        normalized: dict[str, str | list[str]] = {}
+        for raw_key, raw_answer in value.items():
+            key = str(raw_key).strip()
+            if not key or len(key) > 80:
+                raise ValueError("Invalid onboarding answer key")
+            if isinstance(raw_answer, list):
+                if len(raw_answer) > 20:
+                    raise ValueError("Too many values for an onboarding answer")
+                normalized[key] = [str(item).strip()[:160] for item in raw_answer if str(item).strip()]
+            else:
+                normalized[key] = str(raw_answer).strip()[:160]
+        return normalized

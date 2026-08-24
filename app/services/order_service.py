@@ -138,6 +138,15 @@ class OrderService:
         Returns:
             Paid order.
         """
+        # Every payment entry point must serialize on the order row. The balance
+        # path already locks before calling this method, while webhook/mock paths
+        # may arrive concurrently with the same pending order.
+        locked_order = await db.scalar(
+            select(CommerceOrder).where(CommerceOrder.id == order.id).with_for_update()
+        )
+        if not locked_order:
+            raise BusinessError("订单不存在", status_code=404, code="ORDER_NOT_FOUND")
+        order = locked_order
         if order.payment_status == CommercePaymentStatus.PAID:
             return order
         if order.status != CommerceOrderStatus.PENDING:

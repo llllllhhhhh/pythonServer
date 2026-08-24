@@ -11,19 +11,16 @@ from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.core.asset_access import asset_api_url, extract_asset_reference, sign_asset_url
 from app.core.database import SessionLocal, get_db
-from app.core.security import get_current_user, get_optional_user, require_admin
+from app.core.security import get_current_user, get_optional_user, load_session_user_by_token, require_admin
 from app.core.storage import save_upload_bytes
 from app.core.upload_settings import get_upload_setting
 from app.api.merchant import extract_bearer_token, get_current_school
-from app.models import CommerceOrder, CommerceOrderItem, SchoolMerchantSession, SchoolSite, StudyOrder, SupportConversation, SupportMessage, UploadedAsset, UserAccount, UserSession
+from app.models import CommerceOrder, CommerceOrderItem, SchoolMerchantSession, SchoolSite, StudyOrder, SupportConversation, SupportMessage, UploadedAsset, UserAccount
 from app.schemas.api import SupportSessionPayload
 
 router = APIRouter(prefix="/support", tags=["support"])
-
-UPLOAD_ROOT = Path(settings.upload_dir) / "support"
-
 
 def build_image_thumbnail(content: bytes, max_width: int = 360) -> bytes | None:
     try:
@@ -70,8 +67,8 @@ def message_dict(message: SupportMessage) -> dict:
         "content": message.content,
         "message_type": message.message_type,
         "extra": extra,
-        "image_url": message.image_url,
-        "image_thumb_url": message.image_thumb_url or "",
+        "image_url": sign_asset_url(message.image_url),
+        "image_thumb_url": sign_asset_url(message.image_thumb_url or ""),
         "created_at": message.created_at.isoformat() if message.created_at else datetime.now().isoformat(),
     }
 
@@ -137,6 +134,30 @@ class SupportConnectionManager:
 
 
 manager = SupportConnectionManager()
+
+
+async def authorize_support_websocket(
+    db: AsyncSession,
+    conversation: SupportConversation,
+    role: str,
+    token: str,
+) -> bool:
+    if role == "admin":
+        return bool(await load_session_user_by_token(db, token, expected_role="admin"))
+    if role == "user":
+        current_user = await load_session_user_by_token(db, token, expected_role="user")
+        return bool(current_user and conversation.user_id == current_user.user_no)
+    if role != "merchant":
+        return False
+    session = await db.get(SchoolMerchantSession, token)
+    if not session or session.expires_at < datetime.now() or session.school_id != conversation.school_id:
+        return False
+    school = await db.get(SchoolSite, session.school_id)
+    if not school or not school.status or school.review_status != "approved":
+        return False
+    session.last_seen_at = datetime.now()
+    await db.commit()
+    return True
 
 
 async def sync_presence(conversation_id: str) -> None:
@@ -367,7 +388,13 @@ async def upload_support_image(
     if role not in {"user", "admin", "merchant"}:
         raise HTTPException(status_code=400, detail="unsupported upload role")
     if role == "admin":
-        await require_admin(x_admin_key=request.headers.get("x-admin-key"), authorization=request.headers.get("authorization"), db=db)
+        admin_user = await load_session_user_by_token(
+            db,
+            extract_bearer_token(request.headers.get("authorization")) or "",
+            expected_role="admin",
+        )
+        if not admin_user:
+            raise HTTPException(status_code=403, detail="admin upload forbidden")
     conversation = await db.get(SupportConversation, conversation_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="conversation not found")
@@ -405,7 +432,7 @@ async def upload_support_image(
     )
     db.add(asset)
     await db.flush()
-    public_url = f"{settings.api_prefix}/public/assets/{asset.id}/file"
+    public_url = asset_api_url(asset.id)
     thumb_url = public_url
     thumb_content = build_image_thumbnail(content)
     if thumb_content:
@@ -427,10 +454,15 @@ async def upload_support_image(
         )
         db.add(thumb_asset)
         await db.flush()
-        thumb_url = f"{settings.api_prefix}/public/assets/{thumb_asset.id}/file"
+        thumb_url = asset_api_url(thumb_asset.id)
     await db.commit()
     await db.refresh(asset)
-    return {"url": public_url, "thumb_url": thumb_url, "path": public_url, "storage": stored.storage}
+    return {
+        "url": sign_asset_url(public_url),
+        "thumb_url": sign_asset_url(thumb_url),
+        "path": sign_asset_url(public_url),
+        "storage": stored.storage,
+    }
 
 
 @router.websocket("/ws/{conversation_id}")
@@ -439,7 +471,6 @@ async def support_websocket(
     conversation_id: str,
     role: str = Query(default="user"),
     token: str = Query(default=""),
-    user_id: str = Query(default=""),
 ):
     if role not in {"user", "admin", "merchant"}:
         await websocket.close(code=1008)
@@ -449,24 +480,7 @@ async def support_websocket(
         if not conversation:
             await websocket.close(code=1008)
             return
-        if role == "admin":
-            if token == settings.admin_api_key:
-                pass
-            else:
-                session = await db.scalar(
-                    select(UserAccount)
-                    .join(UserSession, UserSession.user_id == UserAccount.id)
-                    .where(UserSession.token == token, UserAccount.role == "admin", UserAccount.status == "active")
-                )
-                if not session:
-                    await websocket.close(code=1008)
-                    return
-        elif role == "merchant":
-            session = await db.get(SchoolMerchantSession, token)
-            if not session or session.expires_at < datetime.now() or session.school_id != conversation.school_id:
-                await websocket.close(code=1008)
-                return
-        elif conversation.user_id != user_id:
+        if not await authorize_support_websocket(db, conversation, role, token):
             await websocket.close(code=1008)
             return
     await manager.connect(conversation_id, role, websocket)
@@ -490,7 +504,7 @@ async def support_websocket(
             image_url = str(data.get("image_url", "")).strip()
             image_thumb_url = str(data.get("image_thumb_url", "")).strip()
             if message_type == "image" and not image_url:
-                await websocket.send_json({"type": "error", "message": "鍥剧墖娑堟伅缂哄皯鍦板潃"})
+                await websocket.send_json({"type": "error", "message": "图片消息缺少地址"})
                 continue
             if message_type == "text" and not content:
                 continue
@@ -509,6 +523,20 @@ async def support_websocket(
                 if not conversation or conversation.status != "open":
                     await websocket.send_json({"type": "error", "message": "conversation closed"})
                     continue
+                if message_type == "image":
+                    image_reference = extract_asset_reference(image_url)
+                    image_asset = await db.get(UploadedAsset, image_reference[0]) if image_reference else None
+                    if not image_asset or image_asset.conversation_id != conversation_id or image_asset.source != "support":
+                        await websocket.send_json({"type": "error", "message": "invalid conversation image"})
+                        continue
+                    image_url = asset_api_url(image_asset.id)
+                    thumb_reference = extract_asset_reference(image_thumb_url)
+                    thumb_asset = await db.get(UploadedAsset, thumb_reference[0]) if thumb_reference else None
+                    image_thumb_url = (
+                        asset_api_url(thumb_asset.id)
+                        if thumb_asset and thumb_asset.conversation_id == conversation_id and thumb_asset.source == "support_thumb"
+                        else image_url
+                    )
                 if role == "user":
                     sender_name = conversation.user_name
                 elif role == "merchant":

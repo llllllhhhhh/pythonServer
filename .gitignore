@@ -4,3 +4,8 @@ __pycache__/
 .venv/
 .pytest_cache/
 .idea/
+*.log
+*.db
+*.sqlite3
+backups/
+uploads/

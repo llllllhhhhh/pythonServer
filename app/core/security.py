@@ -6,7 +6,6 @@ from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.database import get_db
 from app.models import UserAccount, UserSession
 
@@ -41,6 +40,28 @@ async def _load_session_user(
     return user
 
 
+async def load_session_user_by_token(
+    db: AsyncSession,
+    token: str,
+    expected_role: str | None = None,
+) -> UserAccount | None:
+    if not token:
+        return None
+    session = await db.get(UserSession, token)
+    if not session or session.expires_at < datetime.now():
+        return None
+    if expected_role and session.role != expected_role:
+        return None
+    user = await db.get(UserAccount, session.user_id)
+    if not user or user.status != "active" or user.role != session.role:
+        return None
+    if expected_role and user.role != expected_role:
+        return None
+    session.last_seen_at = datetime.now()
+    await db.commit()
+    return user
+
+
 async def get_current_user(
     authorization: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
@@ -59,12 +80,9 @@ async def get_optional_user(
 
 
 async def require_admin(
-    x_admin_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
-) -> UserAccount | None:
-    if x_admin_key == settings.admin_api_key:
-        return None
+) -> UserAccount:
     user = await _load_session_user(db, authorization, expected_role="admin")
     if user:
         return user

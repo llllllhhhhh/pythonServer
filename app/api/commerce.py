@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.merchant import get_current_school
@@ -12,9 +13,10 @@ from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
 from app.core.exceptions import BusinessError
 from app.core.order_status import CommercePaymentStatus, ReviewStatus
-from app.models import CommerceOrder, LearningProfile, SchoolSite, StudyContent, StudyOrder, StudyProduct, TravelRoute, UserAccount, UserEntitlement, WalletTransaction
+from app.models import CommerceOrder, LearningCheckinRecord, LearningProfile, PointRule, PreferenceEvent, SchoolSite, StudyContent, StudyOrder, StudyProduct, TravelRoute, UserAccount, UserEntitlement, WalletTransaction
 from app.schemas.api import RouteCreate, RouteOut, RouteUpdate
 from app.schemas.commerce import (
+    LearningOnboardingUpdate,
     LearningProfileUpdate,
     StudyOrderCreate,
     StudyOrderOut,
@@ -23,6 +25,7 @@ from app.schemas.commerce import (
 )
 from app.schemas.order import OrderCreateRequest, OrderOut
 from app.services.order_service import OrderService
+from app.services.point_service import PointService
 
 router = APIRouter(tags=["study-commerce"])
 
@@ -97,6 +100,19 @@ async def replace_contents(db: AsyncSession, product_id: int, rows: list) -> Non
     await db.execute(delete(StudyContent).where(StudyContent.product_id == product_id))
     for row in rows:
         db.add(StudyContent(product_id=product_id, **row.model_dump()))
+
+
+async def get_point_rule(db: AsyncSession) -> PointRule:
+    rule = await db.get(PointRule, 1)
+    if not rule:
+        rule = PointRule(id=1)
+        db.add(rule)
+        await db.flush()
+    return rule
+
+
+def point_expires_at(rule: PointRule) -> datetime:
+    return datetime.now() + timedelta(days=max(1, int(rule.valid_days or 365)))
 
 
 @router.get("/public/study/products")
@@ -221,7 +237,7 @@ async def mock_pay_standard_order(
     db: AsyncSession = Depends(get_db),
 ) -> OrderOut:
     """Mock pay a standard order in development/test environments."""
-    if settings.environment not in {"development", "test"}:
+    if settings.environment.strip().lower() not in {"development", "test"}:
         raise HTTPException(status_code=403, detail="生产环境不允许模拟支付")
     order = await OrderService.get_order_by_no(db, order_no)
     if not order or order.user_id != user.id:
@@ -254,21 +270,41 @@ async def grant_entitlement(db: AsyncSession, order: StudyOrder, product: StudyP
         product.stock -= 1
 
 
+async def grant_study_purchase_points(db: AsyncSession, order: StudyOrder) -> None:
+    rule = await get_point_rule(db)
+    amount = int(rule.purchase_score or 0)
+    if not rule.enabled or not rule.purchase_enabled or amount <= 0:
+        return
+    user = await PointService.lock_user(db, order.user_id)
+    await PointService.credit_locked(
+        db,
+        user,
+        amount,
+        biz_type="study_purchase",
+        biz_id=order.id,
+        biz_no=order.order_no,
+        idempotency_key=f"study-purchase:{order.id}",
+        remark=f"购买课程 {order.product_name} 奖励",
+        expires_at=point_expires_at(rule),
+    )
+
+
 @router.post("/commerce/orders/{order_id}/pay/mock", response_model=StudyOrderOut)
 async def mock_pay(order_id: int, user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    if settings.environment not in {"development", "test"}:
+    if settings.environment.strip().lower() not in {"development", "test"}:
         raise HTTPException(status_code=403, detail="生产环境不允许模拟支付")
-    order = await db.get(StudyOrder, order_id)
+    order = await db.scalar(select(StudyOrder).where(StudyOrder.id == order_id).with_for_update())
     if not order or order.user_id != user.id:
         raise HTTPException(status_code=404, detail="订单不存在")
     if order.payment_status == CommercePaymentStatus.PAID:
         return order
-    product = await db.get(StudyProduct, order.product_id)
+    product = await db.scalar(select(StudyProduct).where(StudyProduct.id == order.product_id).with_for_update())
     if not product:
         raise HTTPException(status_code=404, detail="商品不存在")
     order.payment_status, order.payment_method = CommercePaymentStatus.PAID, "mock"
     order.transaction_id, order.paid_at = f"MOCK-{uuid4().hex.upper()}", datetime.now()
     await grant_entitlement(db, order, product)
+    await grant_study_purchase_points(db, order)
     await db.commit()
     await db.refresh(order)
     return order
@@ -294,6 +330,34 @@ async def my_study_orders(user: UserAccount = Depends(get_current_user), db: Asy
     return list(await db.scalars(select(StudyOrder).where(StudyOrder.user_id == user.id).order_by(StudyOrder.id.desc())))
 
 
+async def ensure_learning_checkin_record(
+    db: AsyncSession,
+    user_id: int,
+    checkin_at: datetime,
+    checkin_days: int,
+) -> LearningCheckinRecord:
+    checkin_date = checkin_at.date().isoformat()
+    existing = await db.scalar(
+        select(LearningCheckinRecord).where(
+            LearningCheckinRecord.user_id == user_id,
+            LearningCheckinRecord.checkin_date == checkin_date,
+        )
+    )
+    if existing:
+        return existing
+    record = LearningCheckinRecord(
+        user_id=user_id,
+        checkin_date=checkin_date,
+        checkin_at=checkin_at,
+        checkin_days=checkin_days or 1,
+        note="今日已完成学习签到",
+    )
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
 @router.get("/commerce/me/learning-center")
 async def learning_center(user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     entitlements = list(await db.scalars(select(UserEntitlement).where(UserEntitlement.user_id == user.id).order_by(UserEntitlement.id.desc())))
@@ -307,6 +371,30 @@ async def learning_center(user: UserAccount = Depends(get_current_user), db: Asy
         db.add(profile)
         await db.commit()
         await db.refresh(profile)
+    today = datetime.now().date().isoformat()
+    checkin_records = list(
+        await db.scalars(
+            select(LearningCheckinRecord)
+            .where(LearningCheckinRecord.user_id == user.id)
+            .order_by(LearningCheckinRecord.checkin_at.desc(), LearningCheckinRecord.id.desc())
+            .limit(60)
+        )
+    )
+    if profile.last_checkin_at and not any(item.checkin_date == profile.last_checkin_at.date().isoformat() for item in checkin_records):
+        record = await ensure_learning_checkin_record(db, user.id, profile.last_checkin_at, profile.checkin_days)
+        checkin_records.insert(0, record)
+    if profile.last_checkin_at and not any(item.checkin_date == profile.last_checkin_at.date().isoformat() for item in checkin_records):
+        checkin_records.insert(
+            0,
+            LearningCheckinRecord(
+                id=0,
+                user_id=user.id,
+                checkin_date=profile.last_checkin_at.date().isoformat(),
+                checkin_at=profile.last_checkin_at,
+                checkin_days=profile.checkin_days or 1,
+                note="今日已完成学习打卡",
+            ),
+        )
     rights = []
     for row in entitlements:
         product = products.get(row.product_id)
@@ -328,11 +416,28 @@ async def learning_center(user: UserAccount = Depends(get_current_user), db: Asy
         "profile": {
             "target_exam": profile.target_exam,
             "current_stage": profile.current_stage,
+            "school_major_status": profile.school_major_status,
+            "interest_tags": profile.interest_tags or [],
+            "onboarding_version": profile.onboarding_version,
+            "onboarding_answers": profile.onboarding_answers or {},
+            "onboarding_completed_at": profile.onboarding_completed_at,
             "total_minutes": profile.total_minutes,
             "checkin_days": profile.checkin_days,
             "last_checkin_at": profile.last_checkin_at,
+            "checked_today": any(item.checkin_date == today for item in checkin_records)
+            or bool(profile.last_checkin_at and profile.last_checkin_at.date().isoformat() == today),
             "advisor_notes": profile.advisor_notes,
         },
+        "checkin_records": [
+            {
+                "id": item.id,
+                "checkin_date": item.checkin_date,
+                "checkin_at": item.checkin_at,
+                "checkin_days": item.checkin_days,
+                "note": item.note,
+            }
+            for item in checkin_records
+        ],
         "entitlements": rights,
     }
 
@@ -348,18 +453,161 @@ async def update_learning_profile(payload: LearningProfileUpdate, user: UserAcco
     return {"ok": True}
 
 
-@router.post("/commerce/me/check-in")
-async def study_check_in(user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+def _answer_text(answers: dict, key: str) -> str:
+    value = answers.get(key, "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _answer_list(answers: dict, key: str) -> list[str]:
+    value = answers.get(key, [])
+    return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+
+
+@router.put("/commerce/me/onboarding")
+async def complete_learning_onboarding(
+    payload: LearningOnboardingUpdate,
+    user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     profile = await db.scalar(select(LearningProfile).where(LearningProfile.user_id == user.id))
     if not profile:
         profile = LearningProfile(user_id=user.id)
         db.add(profile)
-    if profile.last_checkin_at and profile.last_checkin_at.date() == datetime.now().date():
-        return {"checked": True, "checkin_days": profile.checkin_days, "message": "今天已经打卡"}
-    profile.checkin_days += 1
-    profile.last_checkin_at = datetime.now()
+        await db.flush()
+
+    if payload.version < profile.onboarding_version:
+        return {"ok": True, "version": profile.onboarding_version, "ignored": True}
+    if payload.version == profile.onboarding_version and profile.onboarding_completed_at:
+        return {"ok": True, "version": profile.onboarding_version, "ignored": False}
+
+    answers = payload.answers
+    stage = _answer_text(answers, "stage")
+    target = _answer_text(answers, "target")
+    school_major_status = _answer_text(answers, "schoolMajorStatus")
+    interests = _answer_list(answers, "interests")
+
+    if stage:
+        profile.current_stage = stage[:80]
+    if target:
+        profile.target_exam = target[:80]
+    profile.school_major_status = school_major_status[:80]
+    profile.interest_tags = interests
+    profile.onboarding_version = payload.version
+    profile.onboarding_answers = answers
+    profile.onboarding_completed_at = datetime.now()
+
+    for interest in interests:
+        db.add(
+            PreferenceEvent(
+                user_id=str(user.id),
+                user_name=user.nickname,
+                preference_type="study",
+                target_key=interest[:120],
+                target_name=interest[:160],
+                action="onboarding_select",
+                score=5,
+            )
+        )
+
     await db.commit()
-    return {"checked": True, "checkin_days": profile.checkin_days, "message": "打卡成功"}
+    return {"ok": True, "version": profile.onboarding_version, "ignored": False}
+
+
+@router.post("/commerce/me/check-in")
+async def study_check_in(user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    profile = await db.scalar(
+        select(LearningProfile).where(LearningProfile.user_id == user.id).with_for_update()
+    )
+    if not profile:
+        profile = LearningProfile(user_id=user.id)
+        db.add(profile)
+        await db.flush()
+    now = datetime.now()
+    today = now.date().isoformat()
+    existing = await db.scalar(
+        select(LearningCheckinRecord).where(
+            LearningCheckinRecord.user_id == user.id,
+            LearningCheckinRecord.checkin_date == today,
+        )
+    )
+    if existing or (profile.last_checkin_at and profile.last_checkin_at.date() == now.date()):
+        if not existing and profile.last_checkin_at:
+            existing = await ensure_learning_checkin_record(db, user.id, profile.last_checkin_at, profile.checkin_days)
+        record_time = existing.checkin_at if existing else profile.last_checkin_at
+        return {
+            "checked": True,
+            "checkin_days": profile.checkin_days,
+            "message": "今天已经打卡",
+            "record": {
+                "id": existing.id if existing else 0,
+                "checkin_date": today,
+                "checkin_at": record_time,
+                "checkin_days": profile.checkin_days,
+                "note": (existing.note if existing else "") or "今日已完成学习打卡",
+            },
+        }
+    profile.checkin_days += 1
+    profile.last_checkin_at = now
+    record = LearningCheckinRecord(
+        user_id=user.id,
+        checkin_date=today,
+        checkin_at=now,
+        checkin_days=profile.checkin_days,
+        note="今日已完成学习打卡",
+    )
+    db.add(record)
+    rule = await get_point_rule(db)
+    if rule.enabled and rule.checkin_enabled and int(rule.checkin_score or 0) > 0:
+        locked_user = await PointService.lock_user(db, user.id)
+        await PointService.credit_locked(
+            db,
+            locked_user,
+            int(rule.checkin_score),
+            biz_type="learning_checkin",
+            biz_id=0,
+            biz_no=today,
+            idempotency_key=f"learning-checkin:{user.id}:{today}",
+            remark="学习签到奖励",
+            expires_at=point_expires_at(rule),
+        )
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        existing = await db.scalar(
+            select(LearningCheckinRecord).where(
+                LearningCheckinRecord.user_id == user.id,
+                LearningCheckinRecord.checkin_date == today,
+            )
+        )
+        profile = await db.scalar(select(LearningProfile).where(LearningProfile.user_id == user.id))
+        if not existing or not profile:
+            raise
+        return {
+            "checked": True,
+            "checkin_days": profile.checkin_days,
+            "message": "今天已经打卡",
+            "record": {
+                "id": existing.id,
+                "checkin_date": existing.checkin_date,
+                "checkin_at": existing.checkin_at,
+                "checkin_days": existing.checkin_days,
+                "note": existing.note or "今日已完成学习打卡",
+            },
+        }
+    await db.refresh(record)
+    return {
+        "checked": True,
+        "checkin_days": profile.checkin_days,
+        "message": "打卡成功",
+        "record": {
+            "id": record.id,
+            "checkin_date": record.checkin_date,
+            "checkin_at": record.checkin_at,
+            "checkin_days": record.checkin_days,
+            "note": record.note,
+        },
+    }
 
 
 @router.get("/admin/study/products", dependencies=[Depends(require_admin)])
@@ -370,7 +618,7 @@ async def admin_products(db: AsyncSession = Depends(get_db)):
 
 @router.post("/admin/study/products", dependencies=[Depends(require_admin)], status_code=201)
 async def create_product(payload: StudyProductPayload, db: AsyncSession = Depends(get_db)):
-    data = payload.model_dump(exclude={"contents"})
+    data = payload.model_dump(exclude={"contents", "review_status", "reject_reason"})
     data["review_status"] = ReviewStatus.APPROVED
     data["reject_reason"] = ""
     item = StudyProduct(**data)
@@ -387,7 +635,7 @@ async def update_product(product_id: int, payload: StudyProductPayload, db: Asyn
     item = await db.get(StudyProduct, product_id)
     if not item:
         raise HTTPException(status_code=404, detail="商品不存在")
-    data = payload.model_dump(exclude={"contents"})
+    data = payload.model_dump(exclude={"contents", "review_status", "reject_reason"})
     if item.review_status != ReviewStatus.APPROVED:
         data["status"] = False
     for key, value in data.items():

@@ -1,20 +1,52 @@
+x-app-environment: &app-environment
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  APP_VERSION: ${APP_VERSION:-1.1.0}
+  BUILD_COMMIT: ${BUILD_COMMIT:-development}
+  APP_SECRET_KEY: ${APP_SECRET_KEY:-development-only-change-me-32-bytes}
+  WECHAT_MINI_APP_ID: ${WECHAT_MINI_APP_ID:-}
+  WECHAT_MINI_APP_SECRET: ${WECHAT_MINI_APP_SECRET:-}
+  ASSET_URL_TTL_SECONDS: ${ASSET_URL_TTL_SECONDS:-900}
+  MYSQL_HOST: mysql
+  MYSQL_PORT: 3306
+  MYSQL_USER: ${COMPOSE_MYSQL_USER:-xuetuxing}
+  MYSQL_PASSWORD: ${COMPOSE_MYSQL_PASSWORD:-xuetuxing123}
+  MYSQL_DATABASE: ${COMPOSE_MYSQL_DATABASE:-xuetuxing}
+  ALLOW_LEGACY_SCHEMA_ADOPTION: ${ALLOW_LEGACY_SCHEMA_ADOPTION:-false}
+  REDIS_URL: redis://redis:6379/0
+  REDIS_ENABLED: "true"
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5178,http://127.0.0.1:5178}
+  TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1}
+  STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+  UPLOAD_DIR: /app/uploads
+  OBS_ACCESS_KEY: ${OBS_ACCESS_KEY:-}
+  OBS_SECRET_KEY: ${OBS_SECRET_KEY:-}
+  OBS_BUCKET: ${OBS_BUCKET:-}
+  OBS_REGION: ${OBS_REGION:-cn-north-4}
+  OBS_ENDPOINT: ${OBS_ENDPOINT:-}
+
+x-app-depends-on: &app-depends-on
+  mysql:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
 services:
   mysql:
     image: mysql:8.4
     container_name: xuetuxing-mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root123456
-      MYSQL_DATABASE: xuetuxing
-      MYSQL_USER: xuetuxing
-      MYSQL_PASSWORD: xuetuxing123
+      MYSQL_ROOT_PASSWORD: ${COMPOSE_MYSQL_ROOT_PASSWORD:-root123456}
+      MYSQL_DATABASE: ${COMPOSE_MYSQL_DATABASE:-xuetuxing}
+      MYSQL_USER: ${COMPOSE_MYSQL_USER:-xuetuxing}
+      MYSQL_PASSWORD: ${COMPOSE_MYSQL_PASSWORD:-xuetuxing123}
       TZ: Asia/Shanghai
     ports:
       - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot123456"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -34,30 +66,54 @@ services:
       timeout: 3s
       retries: 20
 
+  migrate:
+    build: .
+    container_name: xuetuxing-migrate
+    restart: "no"
+    command: python -m app.db_migrate
+    environment: *app-environment
+    depends_on: *app-depends-on
+
   api:
     build: .
     container_name: xuetuxing-api
     restart: unless-stopped
-    environment:
-      MYSQL_HOST: mysql
-      MYSQL_PORT: 3306
-      MYSQL_USER: xuetuxing
-      MYSQL_PASSWORD: xuetuxing123
-      MYSQL_DATABASE: xuetuxing
-      REDIS_URL: redis://redis:6379/0
-      REDIS_ENABLED: "true"
-      ADMIN_API_KEY: xuetuxing-dev-key
-      # Development/HBuilderX uses a changing H5 port. Production should
-      # replace this with the actual frontend domain.
-      CORS_ORIGINS: "*"
+    environment: *app-environment
     ports:
       - "8000:8000"
+    volumes:
+      - uploads_data:/app/uploads
     depends_on:
       mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build: .
+    container_name: xuetuxing-worker
+    restart: unless-stopped
+    command: rq worker --with-scheduler --url redis://redis:6379/0 xuetuxing-orders
+    environment: *app-environment
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   mysql_data:
   redis_data:
+  uploads_data:

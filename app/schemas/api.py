@@ -2,8 +2,9 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_serializer, field_validator, model_validator
 
+from app.core.asset_access import asset_api_url, sign_asset_url
 from app.core.order_status import (
     TRAVEL_CONTRACT_STATUS_TEXT,
     TRAVEL_FULFILLMENT_STATUS_TEXT,
@@ -16,6 +17,7 @@ class DecorationPayload(BaseModel):
     pages: list[dict[str, Any]]
     routes: list[dict[str, Any]] = Field(default_factory=list)
     points: dict[str, Any] = Field(default_factory=dict)
+    onboarding: dict[str, Any] = Field(default_factory=dict)
 
 
 class DecorationResponse(BaseModel):
@@ -116,11 +118,16 @@ class TravelRouteReviewEligibilityOut(BaseModel):
 
 
 class PointRulePayload(BaseModel):
-    invite_score: int = 1
-    exchange_score: int = 100
-    valid_days: int = 365
-    yearly_limit: int = 1
-    monthly_stock: int = 50
+    invite_score: int = Field(default=1, ge=0, le=100000)
+    checkin_score: int = Field(default=1, ge=0, le=100000)
+    purchase_score: int = Field(default=5, ge=0, le=100000)
+    exchange_score: int = Field(default=100, ge=1, le=1000000)
+    valid_days: int = Field(default=365, ge=1, le=36500)
+    yearly_limit: int = Field(default=1, ge=0, le=1000)
+    monthly_stock: int = Field(default=50, ge=0, le=100000)
+    invite_enabled: bool = True
+    checkin_enabled: bool = True
+    purchase_enabled: bool = True
     enabled: bool = True
 
 
@@ -144,6 +151,9 @@ class OrderOut(BaseModel):
     amount_text: str
     cover: str | None = ""
     image: str = ""
+    points_cost: int = 0
+    points_refunded: bool = False
+    stock_restored: bool = False
     status: int
     reject_reason: str
     contract_status: str = "unsigned"
@@ -156,7 +166,7 @@ class OrderOut(BaseModel):
     contract_template_content: str = ""
     contract_template_travel_date_days: int = 0
     contract_signature_data: str | None = ""
-    contract_signature_url: str = ""
+    contract_signature_url: str | None = ""
     contract_signed_at: datetime | None = None
     contract_reviewed_at: datetime | None = None
     contract_reject_reason: str = ""
@@ -177,8 +187,11 @@ class OrderOut(BaseModel):
     pickup_confirmed_at: datetime | None = None
     qr_token: str = ""
     qr_issued_at: datetime | None = None
+    qr_expires_at: datetime | None = None
     checked_in_at: datetime | None = None
     completed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    cancel_reason: str = ""
     exception_reason: str = ""
     created_at: datetime
 
@@ -216,12 +229,17 @@ class OrderOut(BaseModel):
         "vehicle_no",
         "pickup_notice",
         "qr_token",
+        "cancel_reason",
         "exception_reason",
         mode="before",
     )
     @classmethod
     def _empty_string_for_null(cls, value):
         return "" if value is None else value
+
+    @field_serializer("contract_signature_url")
+    def _serialize_contract_signature_url(self, value: str | None) -> str:
+        return sign_asset_url(value)
 
     @computed_field
     @property
@@ -236,7 +254,7 @@ class OrderOut(BaseModel):
     @computed_field
     @property
     def contract_signature_image(self) -> str:
-        return self.contract_signature_url or self.contract_signature_data or ""
+        return sign_asset_url(self.contract_signature_url) or self.contract_signature_data or ""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -246,7 +264,7 @@ class RouteExchangePayload(BaseModel):
 
 
 class ContractTemplatePayload(BaseModel):
-    title: str = Field(default="鏃呰鏈嶅姟鍚堝悓", min_length=1, max_length=120)
+    title: str = Field(default="旅行服务合同", min_length=1, max_length=120)
     content: str = Field(min_length=1)
     travel_date_days: int = Field(default=30, ge=0, le=365)
 
@@ -293,6 +311,10 @@ class TravelPickupSchedulePayload(BaseModel):
 
 class TravelOrderExceptionPayload(BaseModel):
     reason: str = Field(min_length=1, max_length=255)
+
+
+class TravelOrderCancelPayload(BaseModel):
+    reason: str = Field(min_length=2, max_length=255)
 
 
 class CustomTravelRequestCreate(BaseModel):
@@ -358,7 +380,7 @@ class InviteOut(BaseModel):
 
 class PreferenceEventPayload(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
-    user_name: str = Field(default="灏忓緬鍚屽", max_length=60)
+    user_name: str = Field(default="学徒行同学", max_length=60)
     preference_type: str = Field(pattern="^(route|study)$")
     target_key: str = Field(min_length=1, max_length=120)
     target_name: str = Field(min_length=1, max_length=160)
@@ -376,6 +398,12 @@ class AnnouncementBase(BaseModel):
     published_at: datetime | None = None
     start_at: datetime | None = None
     end_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_publish_window(self) -> "AnnouncementBase":
+        if self.start_at and self.end_at and self.end_at < self.start_at:
+            raise ValueError("end_at must not be earlier than start_at")
+        return self
 
 
 class AnnouncementCreate(AnnouncementBase):
@@ -487,13 +515,13 @@ class MerchantLoginResponse(BaseModel):
 
 class SupportSessionPayload(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
-    user_name: str = Field(default="灏忓緬鍚屽", max_length=60)
+    user_name: str = Field(default="学徒行同学", max_length=60)
 
 
 class RegisterPayload(BaseModel):
     phone: str = Field(min_length=6, max_length=30)
     password: str = Field(min_length=6, max_length=50)
-    nickname: str = Field(default="灏忓緬鍚屽", max_length=60)
+    nickname: str = Field(default="学徒行同学", max_length=60)
     invite_code: str = Field(default="", max_length=64)
     device_id: str = Field(default="", max_length=100)
 
@@ -513,6 +541,21 @@ class InviteRecordOut(BaseModel):
     created_at: datetime
 
 
+class PointLedgerOut(BaseModel):
+    id: int
+    transaction_no: str
+    direction: str
+    amount: int
+    balance_before: int
+    balance_after: int
+    biz_type: str
+    biz_no: str
+    remark: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class InviteDashboardOut(BaseModel):
     invite_code: str
     invite_payload: str
@@ -523,11 +566,65 @@ class InviteDashboardOut(BaseModel):
     invited_count: int
     granted_count: int
     records: list[InviteRecordOut]
+    ledger: list[PointLedgerOut] = Field(default_factory=list)
 
 
 class LoginPayload(BaseModel):
     account: str = Field(min_length=3, max_length=60)
     password: str = Field(min_length=6, max_length=50)
+    slider_ticket: str = Field(default="", max_length=120)
+
+
+class WechatMiniLoginPayload(BaseModel):
+    code: str = Field(min_length=1, max_length=128)
+    phone_code: str = Field(min_length=1, max_length=128)
+    invite_code: str = Field(default="", max_length=64)
+    device_id: str = Field(default="", max_length=160)
+
+
+class SliderCaptchaImagePayload(BaseModel):
+    name: str = Field(default="", max_length=60)
+    url: str = Field(min_length=1, max_length=500)
+    enabled: bool = True
+
+
+class SliderCaptchaSettingsPayload(BaseModel):
+    enabled: bool = True
+    title: str = Field(default="拖动滑块完成验证", min_length=1, max_length=80)
+    description: str = Field(default="请按住滑块，将缺口拼合后再登录。", max_length=160)
+    image: str = Field(default="", max_length=500)
+    images: list[SliderCaptchaImagePayload] = Field(default_factory=list, max_length=20)
+    shape: str = Field(default="rounded", pattern="^(rounded|circle|square|puzzle)$")
+    tolerance: int = Field(default=6, ge=2, le=20)
+    expires_seconds: int = Field(default=120, ge=30, le=300)
+
+
+class SliderCaptchaSettingsOut(SliderCaptchaSettingsPayload):
+    pass
+
+
+class SliderCaptchaChallengeOut(BaseModel):
+    enabled: bool
+    challenge_id: str = ""
+    title: str
+    description: str
+    image: str
+    shape: str = "rounded"
+    target_x: int = 0
+    piece_y: int = 0
+    piece_size: int = 42
+    expires_seconds: int = 120
+
+
+class SliderCaptchaVerifyPayload(BaseModel):
+    challenge_id: str = Field(min_length=1, max_length=80)
+    x: int = Field(ge=0, le=1000)
+    scope: str = Field(pattern="^(user|admin|merchant)$")
+
+
+class SliderCaptchaVerifyOut(BaseModel):
+    verified: bool
+    ticket: str = ""
 
 
 class UserOut(BaseModel):
@@ -540,7 +637,7 @@ class UserOut(BaseModel):
     avatar: str = ""
     points: int = 0
     balance: Decimal = Decimal("0.00")
-    exam_status: str = "瀛﹀憳"
+    exam_status: str = "学员"
     is_registered: bool = True
     last_login_at: datetime | None = None
     created_at: datetime
@@ -584,7 +681,6 @@ class GraduationCertificationOut(BaseModel):
     real_name: str
     school_name: str
     major_name: str
-    graduation_date: str
     certificate_no: str
     certificate_image: str
     status: str
@@ -593,6 +689,11 @@ class GraduationCertificationOut(BaseModel):
     reviewed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+    @field_serializer("certificate_image")
+    def _serialize_certificate_image(self, value: str) -> str:
+        return sign_asset_url(value)
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -663,6 +764,11 @@ class UploadedAssetOut(BaseModel):
     conversation_id: str = ""
     created_at: datetime
     updated_at: datetime
+
+    @field_serializer("path", "url")
+    def _serialize_asset_url(self, _value: str) -> str:
+        return sign_asset_url(asset_api_url(self.id))
+
     model_config = ConfigDict(from_attributes=True)
 
 
