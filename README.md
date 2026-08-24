@@ -73,7 +73,6 @@ OBS_SECRET_KEY=你的华为云 OBS Secret Access Key
 OBS_BUCKET=xuetuxing
 OBS_REGION=cn-north-4
 OBS_ENDPOINT=obs.cn-north-4.myhuaweicloud.com
-OBS_PUBLIC_BASE_URL=https://xuetuxing.obs.cn-north-4.myhuaweicloud.com
 ```
 
 先创建 MySQL 数据库 `xuetuxing`，再执行 Alembic。API 启动时不会建表或改表；数据库不是当前版本时会拒绝启动。
@@ -297,8 +296,11 @@ python -m app.cli seed-development --admin-password "仅限本地的测试密码
 | 人工定制审核 | `/api/v1/admin/custom-travel/requests` | 管理后台审核并填写方案 |
 | 学习产品 | `/api/v1/public/study/products` | 用户端学习服务列表 |
 | 学习订单 | `/api/v1/commerce/standard-orders` | 余额购买学习产品 |
+| 订单退款 | `/api/v1/admin/commerce/orders/{order_no}/refund` | 管理员退款（幂等，回补余额与库存） |
+| 邀请积分补发 | `/api/v1/admin/invites/backfill-rewards` | 规则开启后补发历史邀请积分 |
+| 偏好事件 | `/api/v1/public/preferences/events` | 用户偏好采集（登录用户强制归属，游客按 IP 限流） |
 | 商户端 | `/api/v1/merchant/login` | 学校商户登录 |
-| 客服 | `/api/v1/support/ws/{id}` | WebSocket 实时客服 |
+| 客服 | `/api/v1/support/ws/{id}` | WebSocket 实时客服（token 走 Sec-WebSocket-Protocol 子协议） |
 | 图片资源 | `/api/v1/admin/assets/images` | 管理端查看上传图片 |
 
 完整字段请打开 Swagger 查看。

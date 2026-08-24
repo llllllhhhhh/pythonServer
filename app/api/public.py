@@ -11,7 +11,7 @@ from app.core.cache import cache_get_json, cache_set_json
 from app.core.asset_access import is_public_asset_source, verify_asset_access_token
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_optional_user
 from app.core.storage import load_upload_bytes
 from app.core.travel_match_settings import get_travel_match_settings
 from app.core.upload_settings import get_upload_setting
@@ -304,15 +304,29 @@ async def public_travel_match_settings(db: AsyncSession = Depends(get_db)):
 @router.post("/preferences/events", status_code=201)
 async def record_preference(
     payload: PreferenceEventPayload,
-    current_user: UserAccount = Depends(get_current_user),
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    current_user: UserAccount | None = Depends(get_optional_user),
 ):
-    # Require login and pin the identity server-side so anonymous callers
-    # cannot fabricate preference data for other users. user_id is stored as
-    # str(user.id) to stay consistent with onboarding events (see commerce.py).
+    """Record a preference event.
+
+    Logged-in callers are attributed server-side as str(user.id); anonymous
+    (guest) callers keep their supplied guest id but are rate-limited per IP
+    to prevent flooding the insight data.
+    """
+    if current_user is not None:
+        user_id = str(current_user.id)
+        user_name = payload.user_name or current_user.nickname or "学徒行同学"
+    else:
+        user_id = (payload.user_id or "").strip()[:64]
+        user_name = (payload.user_name or "").strip()[:60]
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required for guest events")
+        if not await _preference_rate_allowed(request):
+            raise HTTPException(status_code=429, detail="偏好上报过于频繁，请稍后再试")
     event = PreferenceEvent(
-        user_id=str(current_user.id),
-        user_name=payload.user_name or current_user.nickname or "学徒行同学",
+        user_id=user_id,
+        user_name=user_name,
         preference_type=payload.preference_type,
         target_key=payload.target_key,
         target_name=payload.target_name,
@@ -322,6 +336,19 @@ async def record_preference(
     db.add(event)
     await db.commit()
     return {"ok": True, "id": event.id}
+
+
+async def _preference_rate_allowed(request: Request, limit: int = 60, window: int = 300) -> bool:
+    """Best-effort per-IP rate limit for anonymous preference events."""
+    from app.core.cache import cache_get_json, cache_set_json
+
+    client_ip = request.client.host if request.client else "unknown"
+    key = f"pref:rate:{client_ip}"
+    current = int((await cache_get_json(key)) or 0)
+    if current >= limit:
+        return False
+    await cache_set_json(key, current + 1, ttl=window)
+    return True
 
 
 @router.get("/assets/{asset_id}/file")

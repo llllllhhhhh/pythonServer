@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
@@ -11,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.public import PUBLIC_CONFIG_KEY
 from app.api.travel_orders import attach_travel_order_details, normalize_fulfillment_status
 from app.core.auth import hash_password
-from app.core.cache import cache_delete
+from app.core.cache import RedisUnavailableError, cache_delete, redis
 from app.core.config import settings
 from app.core.contract_settings import get_contract_template, save_contract_template
 from app.core.database import get_db
@@ -99,6 +100,8 @@ from app.services.travel_order_service import (
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+
+logger = logging.getLogger(__name__)
 
 
 def build_user_row(
@@ -1432,6 +1435,41 @@ async def refund_commerce_order(
     )
     for entitlement in entitlements:
         entitlement.status = "expired"
+
+    # Restore stock for finite-stock products, mirroring cancel_unpaid_order:
+    # only when the database row is actually restored do we also restore Redis,
+    # so the two stores stay aligned.
+    items = list(
+        await db.scalars(
+            select(CommerceOrderItem)
+            .where(CommerceOrderItem.order_id == locked_order.id)
+            .order_by(CommerceOrderItem.id)
+        )
+    )
+    product_ids = {item.product_id for item in items if item.stock_deducted}
+    if product_ids:
+        products = {
+            product.id: product
+            for product in list(
+                await db.scalars(
+                    select(StudyProduct)
+                    .where(StudyProduct.id.in_(product_ids))
+                    .with_for_update()
+                )
+            )
+        }
+        for item in items:
+            if not item.stock_deducted:
+                continue
+            product = products.get(item.product_id)
+            restored_db = bool(product and product.stock >= 0)
+            if restored_db:
+                product.stock += item.quantity
+                try:
+                    await redis.incr_stock(item.product_id, item.quantity)
+                except Exception:  # best-effort; keep the refund itself working
+                    logger.exception("refund_redis_restore_failed", extra={"product_id": item.product_id})
+            item.stock_deducted = False
 
     locked_order.payment_status = CommercePaymentStatus.REFUNDED
     locked_order.status = CommerceOrderStatus.CANCELED
