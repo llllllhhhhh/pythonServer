@@ -211,9 +211,14 @@ class OrderService:
         locked_order = await db.scalar(select(CommerceOrder).where(CommerceOrder.id == order.id).with_for_update())
         if not locked_order or locked_order.user_id != user.id:
             raise BusinessError("订单不存在", status_code=404, code="ORDER_NOT_FOUND")
-        if locked_order.payment_status == CommercePaymentStatus.PAID:
+        # Idempotent replay of an already-paid order is the normal case for
+        # retries; inconsistent rows (paid + canceled, or non-pending statuses)
+        # are rejected.
+        if locked_order.payment_status == CommercePaymentStatus.PAID and locked_order.status == CommerceOrderStatus.PAID:
             return locked_order
         if locked_order.status != CommerceOrderStatus.PENDING:
+            raise BusinessError("订单当前状态不可支付", status_code=400, code="ORDER_NOT_PAYABLE")
+        if locked_order.payment_status == CommercePaymentStatus.PAID:
             raise BusinessError("订单当前状态不可支付", status_code=400, code="ORDER_NOT_PAYABLE")
 
         locked_user = await db.scalar(select(UserAccount).where(UserAccount.id == user.id).with_for_update())
