@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.asset_access import asset_api_url
 from app.core.database import get_db
 from app.core.security import get_current_user
-from app.core.storage import save_upload_bytes
+from app.core.storage import save_upload_bytes, sniff_image_type
 from app.core.upload_settings import get_upload_setting
 from app.models import GraduationCertification, UploadedAsset, UserAccount
 from app.schemas.api import GraduationCertificationOut
@@ -56,6 +56,8 @@ async def submit_graduation_certification(
     content = await file.read(max_file_size + 1)
     if len(content) > max_file_size:
         raise HTTPException(status_code=400, detail=f"学生证图片不能超过 {max_image_mb}MB")
+    if not sniff_image_type(content, suffix):
+        raise HTTPException(status_code=400, detail="图片内容与文件类型不匹配，请上传真实图片")
 
     item = await db.scalar(
         select(GraduationCertification).where(GraduationCertification.user_id == current_user.id)

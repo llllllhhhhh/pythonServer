@@ -200,6 +200,20 @@ class RedisClient:
         """Initialize a product stock key from database stock when missing."""
         await self.raw.set(f"stock:study_product:{product_id}", int(stock), nx=True)
 
+    async def sync_stock(self, product_id: int, stock: int) -> None:
+        """Re-sync an existing Redis stock key to the database value.
+
+        Only updates keys that already exist (finite-stock products that have
+        been ordered at least once); unlimited-stock products never create a
+        key, so admin/merchant edits do not resurrect stale entries.
+        """
+        await self.raw.set(f"stock:study_product:{product_id}", int(stock), xx=True)
+
+    async def get_stock(self, product_id: int) -> int | None:
+        """Return the current Redis stock value, or None when no key exists."""
+        value = await self.raw.get(f"stock:study_product:{product_id}")
+        return int(value) if value is not None else None
+
     async def decr_stock(self, product_id: int, quantity: int) -> int:
         """Atomically decrement stock.
 

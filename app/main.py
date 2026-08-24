@@ -9,11 +9,13 @@ from app.core.cache import close_cache, ensure_cache_available
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.migrations import ensure_database_current
+from app.core.storage import cull_thumb_cache
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+    cull_thumb_cache()
     await ensure_cache_available()
     await ensure_database_current()
     yield

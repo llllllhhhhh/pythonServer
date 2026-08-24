@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError
-from app.core.order_status import TravelFulfillmentStatus
+from app.core.order_status import TravelFulfillmentStatus, TravelOrderStatus
 from app.models import (
     PointLedger,
     PointRule,
@@ -174,7 +174,7 @@ async def cancel_travel_order(
         order.stock_restored = True
 
     order.fulfillment_status = TravelFulfillmentStatus.CANCELLED
-    order.status = 2
+    order.status = int(TravelOrderStatus.CANCELLED)
     order.cancelled_at = datetime.now()
     order.cancel_reason = reason.strip()
     order.qr_token = ""

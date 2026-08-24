@@ -34,6 +34,32 @@ def _safe_suffix(filename: str | None) -> str:
     return suffix if suffix else ".jpg"
 
 
+IMAGE_MAGIC_BYTES: dict[str, bytes] = {
+    ".jpg": b"\xff\xd8\xff",
+    ".jpeg": b"\xff\xd8\xff",
+    ".png": b"\x89PNG\r\n\x1a\n",
+    ".gif": b"GIF87a",
+    ".webp": b"RIFF",
+}
+
+
+def sniff_image_type(content: bytes, suffix: str | None) -> bool:
+    """Verify that uploaded bytes match the declared image extension.
+
+    Extension-only validation can be bypassed by renaming arbitrary content to
+    an image suffix. This sniff checks the magic bytes as a second gate.
+    """
+    suffix = (suffix or "").lower()
+    magic = IMAGE_MAGIC_BYTES.get(suffix)
+    if not magic:
+        return False
+    if not content.startswith(magic):
+        return False
+    if suffix == ".webp":
+        return len(content) >= 12 and content[8:12] == b"WEBP"
+    return True
+
+
 def _content_type(content_type: str | None, suffix: str) -> str:
     if content_type:
         return content_type
@@ -214,3 +240,39 @@ async def load_upload_bytes(object_key: str, storage: str | None = None) -> Load
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="图片不存在")
     return LoadedFile(content=target.read_bytes(), content_type=_content_type(None, target.suffix.lower()))
+
+
+def cull_thumb_cache(max_age_days: int = 7, max_files: int = 2000) -> int:
+    """Remove stale thumbnail cache files on startup.
+
+    The disk thumb cache under ``{upload_dir}/.thumb-cache`` grows without
+    bound; this best-effort cull deletes files older than ``max_age_days``
+    and then, if still over ``max_files``, removes the oldest entries.
+    """
+    from datetime import timedelta
+
+    root = Path(settings.upload_dir) / ".thumb-cache"
+    if not root.exists():
+        return 0
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    removed = 0
+    files = [path for path in root.rglob("*") if path.is_file()]
+    for path in files:
+        try:
+            if path.stat().st_mtime < cutoff.timestamp():
+                path.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed < max_files:
+        remaining = sorted(
+            (path for path in root.rglob("*") if path.is_file()),
+            key=lambda p: p.stat().st_mtime,
+        )
+        for path in remaining[: max(0, len(remaining) - max_files)]:
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                continue
+    return removed

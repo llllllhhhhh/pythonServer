@@ -131,6 +131,7 @@ async def create_slider_challenge(db: AsyncSession) -> dict[str, Any]:
     piece_y = randint(38, 112)
     enabled_images = [item for item in settings["images"] if item["enabled"]]
     image = choice(enabled_images or settings["images"])["url"]
+    challenge_ttl = int(settings["expires_seconds"])
     await cache_set_json(
         f"{SLIDER_CAPTCHA_CHALLENGE_PREFIX}{challenge_id}",
         {
@@ -138,8 +139,10 @@ async def create_slider_challenge(db: AsyncSession) -> dict[str, Any]:
             "piece_y": piece_y,
             "piece_size": piece_size,
             "tolerance": settings["tolerance"],
+            "attempts": 0,
+            "_ttl": challenge_ttl,
         },
-        ttl=settings["expires_seconds"],
+        ttl=challenge_ttl,
     )
     return {
         "enabled": True,
@@ -162,17 +165,24 @@ async def verify_slider_challenge(challenge_id: str, x: int, scope: str) -> dict
     challenge = await cache_get_json(challenge_key)
     if not challenge:
         raise HTTPException(status_code=400, detail="滑块验证已过期，请重试")
-    await cache_delete(challenge_key)
+    if int(challenge.get("attempts") or 0) >= 3:
+        await cache_delete(challenge_key)
+        raise HTTPException(status_code=400, detail="滑块验证已过期，请重试")
     target_x = int(challenge.get("target_x") or 0)
     tolerance = int(challenge.get("tolerance") or DEFAULT_SLIDER_CAPTCHA_SETTINGS["tolerance"])
     if abs(int(x) - target_x) > tolerance:
+        challenge["attempts"] = int(challenge.get("attempts") or 0) + 1
+        ttl = int(challenge.get("_ttl") or DEFAULT_SLIDER_CAPTCHA_SETTINGS["expires_seconds"])
+        await cache_set_json(challenge_key, challenge, ttl=ttl)
         raise HTTPException(status_code=400, detail="滑块位置不正确，请重试")
 
     ticket = uuid4().hex
+    await cache_delete(challenge_key)
+    ttl = int(challenge.get("_ttl") or DEFAULT_SLIDER_CAPTCHA_SETTINGS["expires_seconds"])
     await cache_set_json(
         f"{SLIDER_CAPTCHA_TICKET_PREFIX}{ticket}",
         {"scope": scope},
-        ttl=120,
+        ttl=ttl,
     )
     return {"verified": True, "ticket": ticket}
 

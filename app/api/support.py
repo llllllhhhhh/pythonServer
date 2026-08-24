@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from io import BytesIO
@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.asset_access import asset_api_url, extract_asset_reference, sign_asset_url
 from app.core.database import SessionLocal, get_db
 from app.core.security import get_current_user, get_optional_user, load_session_user_by_token, require_admin
-from app.core.storage import save_upload_bytes
+from app.core.storage import save_upload_bytes, sniff_image_type
 from app.core.upload_settings import get_upload_setting
 from app.api.merchant import extract_bearer_token, get_current_school
 from app.models import CommerceOrder, CommerceOrderItem, SchoolMerchantSession, SchoolSite, StudyOrder, SupportConversation, SupportMessage, UploadedAsset, UserAccount
@@ -414,6 +414,8 @@ async def upload_support_image(
     content = await file.read(max_image_size + 1)
     if len(content) > max_image_size:
         raise HTTPException(status_code=400, detail=f"image must be <= {max_image_mb}MB")
+    if not sniff_image_type(content, suffix):
+        raise HTTPException(status_code=400, detail="图片内容与文件类型不匹配，请上传真实图片")
     stored = await save_upload_bytes(content, file.filename, file.content_type, "support")
     asset = UploadedAsset(
         source="support",
@@ -475,12 +477,23 @@ async def support_websocket(
     if role not in {"user", "admin", "merchant"}:
         await websocket.close(code=1008)
         return
+    # Prefer the token carried in the Sec-WebSocket-Protocol header
+    # (subprotocol "bearer.<token>") over the query parameter. The query
+    # parameter remains accepted during a compatibility window and is removed
+    # once all clients migrate, because tokens in URLs leak into logs/history.
+    resolved_token = token
+    protocols = websocket.headers.get("sec-websocket-protocol", "")
+    for protocol in protocols.split(","):
+        protocol = protocol.strip()
+        if protocol.startswith("bearer."):
+            resolved_token = protocol.removeprefix("bearer.").strip()
+            break
     async with SessionLocal() as db:
         conversation = await db.get(SupportConversation, conversation_id)
         if not conversation:
             await websocket.close(code=1008)
             return
-        if not await authorize_support_websocket(db, conversation, role, token):
+        if not await authorize_support_websocket(db, conversation, role, resolved_token):
             await websocket.close(code=1008)
             return
     await manager.connect(conversation_id, role, websocket)

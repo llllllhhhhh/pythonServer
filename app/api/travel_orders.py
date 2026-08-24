@@ -14,10 +14,10 @@ from app.core.config import settings
 from app.core.asset_access import asset_api_url
 from app.core.contract_settings import get_contract_template
 from app.core.database import get_db
-from app.core.order_status import TravelContractStatus, TravelFulfillmentStatus
+from app.core.order_status import TravelContractStatus, TravelFulfillmentStatus, TravelOrderStatus
 from app.core.security import get_current_user, require_admin
 from app.core.snowflake import SnowflakeGenerator
-from app.core.storage import save_upload_bytes
+from app.core.storage import save_upload_bytes, sniff_image_type
 from app.core.upload_settings import get_upload_setting
 from app.models import ContractTemplateSnapshot, SchoolSite, TravelOrder, TravelRoute, TravelRouteReview, UploadedAsset, UserAccount
 from app.services.point_service import PointService
@@ -347,9 +347,10 @@ async def create_route_review(
     else:
         order = eligible
     if not order:
-        if any(item.fulfillment_status != TravelFulfillmentStatus.COMPLETED for item in orders):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="行程完成后才能评价")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该路线已评价过")
+        completed = [item for item in orders if item.fulfillment_status == TravelFulfillmentStatus.COMPLETED]
+        if completed and all(item.id in reviewed_order_ids for item in completed):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该路线已评价过")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="行程完成后才能评价")
     images = [str(item).strip() for item in payload.images if str(item).strip()][:6]
     review = TravelRouteReview(
         route_id=route_id,
@@ -397,6 +398,8 @@ async def upload_route_review_image(
     content = await file.read(max_image_size + 1)
     if len(content) > max_image_size:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"图片不能超过 {max_image_mb}MB")
+    if not sniff_image_type(content, suffix):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="图片内容与文件类型不匹配，请上传真实图片")
     stored = await save_upload_bytes(content, file.filename or f"route-review{suffix}", file.content_type or "image/jpeg", "travel-reviews")
     asset = UploadedAsset(
         source="travel_review",
@@ -516,7 +519,7 @@ async def exchange_travel_route(
         cover=route.image or "",
         idempotency_key=idempotency_key,
         points_cost=required_points,
-        status=0,
+        status=int(TravelOrderStatus.CREATED),
         contract_status=TravelContractStatus.UNSIGNED,
         fulfillment_status=TravelFulfillmentStatus.CONTRACT_PENDING,
     )

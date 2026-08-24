@@ -1,4 +1,4 @@
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 
 
 class CommercePaymentStatus(StrEnum):
@@ -12,6 +12,12 @@ class CommerceOrderStatus(StrEnum):
     PENDING = "pending"
     PAID = "paid"
     CANCELED = "canceled"
+
+
+class TravelOrderStatus(IntEnum):
+    CREATED = 0
+    COMPLETED = 1
+    CANCELLED = 2
 
 
 class ReviewStatus(StrEnum):

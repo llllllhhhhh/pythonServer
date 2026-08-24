@@ -42,7 +42,6 @@ class Settings(BaseSettings):
     obs_bucket: str = ""
     obs_region: str = "cn-north-4"
     obs_endpoint: str = ""
-    obs_public_base_url: str = ""
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     @model_validator(mode="after")
@@ -65,6 +64,20 @@ class Settings(BaseSettings):
                 raise ValueError("CORS_ORIGINS must use HTTPS in production")
             if self.mysql_password in {"", "xuetuxing123", "root123456"}:
                 raise ValueError("MYSQL_PASSWORD must not use a development default in production")
+            if bool(self.wechat_mch_id) != bool(self.wechat_api_v3_key):
+                raise ValueError("WECHAT_MCH_ID and WECHAT_API_V3_KEY must be configured together")
+            if self.storage_driver.lower() == "obs":
+                missing = [
+                    key
+                    for key, value in {
+                        "OBS_ACCESS_KEY": self.obs_access_key,
+                        "OBS_SECRET_KEY": self.obs_secret_key,
+                        "OBS_BUCKET": self.obs_bucket,
+                    }.items()
+                    if not value
+                ]
+                if missing:
+                    raise ValueError(f"STORAGE_DRIVER=obs requires {', '.join(missing)}")
         return self
 
     @property

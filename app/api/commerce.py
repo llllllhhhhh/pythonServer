@@ -1,13 +1,15 @@
+import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.merchant import get_current_school
+from app.core.cache import RedisUnavailableError, redis
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
@@ -27,6 +29,7 @@ from app.schemas.order import OrderCreateRequest, OrderOut
 from app.services.order_service import OrderService
 from app.services.point_service import PointService
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["study-commerce"])
 
 
@@ -42,6 +45,15 @@ async def commerce_order_out(db: AsyncSession, order: CommerceOrder) -> OrderOut
     """
     items = await OrderService.get_order_items(db, order.id)
     return OrderOut.model_validate({**order.__dict__, "items": items})
+
+
+async def commerce_orders_out_batch(db: AsyncSession, orders: list[CommerceOrder]) -> list[OrderOut]:
+    """Build order responses for many orders with a single items query."""
+    items_map = await OrderService.get_order_items_map(db, [order.id for order in orders])
+    return [
+        OrderOut.model_validate({**order.__dict__, "items": items_map.get(order.id, [])})
+        for order in orders
+    ]
 
 
 def product_dict(item: StudyProduct, contents: list[StudyContent] | None = None, owned: bool = False) -> dict:
@@ -138,9 +150,15 @@ async def public_product_detail(product_id: int, db: AsyncSession = Depends(get_
 @router.post("/commerce/orders", response_model=StudyOrderOut, status_code=status.HTTP_201_CREATED)
 async def create_study_order(
     payload: StudyOrderCreate,
+    response: Response,
     user: UserAccount = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Legacy study-order path. New purchases should use the standard order
+    # flow (/commerce/standard-orders) which supports Redis idempotency,
+    # stock locking and balance payment.
+    response.headers["Deprecation"] = "true"
+    response.headers["Link"] = "</api/v1/commerce/standard-orders>; rel=\"alternate\""
     product = await db.get(StudyProduct, payload.product_id)
     if not product or not product.status or product.review_status != ReviewStatus.APPROVED:
         raise HTTPException(status_code=404, detail="商品不存在或已下架")
@@ -149,7 +167,12 @@ async def create_study_order(
     installments = payload.installment_count if product.installment_enabled else 1
     if installments > product.installment_count:
         raise HTTPException(status_code=400, detail="分期期数超过商品允许范围")
-    amount = (Decimal(product.price) / installments).quantize(Decimal("0.01"))
+    price = Decimal(product.price)
+    amount = (price / installments).quantize(Decimal("0.01"), rounding="ROUND_DOWN")
+    if installments > 1 and amount * installments < price:
+        # Push the rounding remainder into the final installment so the sum
+        # of installments always equals the full price (no free orders).
+        amount = (price - (amount * (installments - 1))).quantize(Decimal("0.01"))
     order = StudyOrder(
         order_no=f"ST{datetime.now():%Y%m%d%H%M%S}{uuid4().hex[:6].upper()}",
         user_id=user.id,
@@ -182,7 +205,7 @@ async def create_standard_order(
 async def my_standard_orders(user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[OrderOut]:
     """List current user's standard commerce orders."""
     orders = list(await db.scalars(select(CommerceOrder).where(CommerceOrder.user_id == user.id).order_by(CommerceOrder.id.desc())))
-    return [await commerce_order_out(db, order) for order in orders]
+    return await commerce_orders_out_batch(db, orders)
 
 
 @router.get("/commerce/wallet")
@@ -643,6 +666,11 @@ async def update_product(product_id: int, payload: StudyProductPayload, db: Asyn
     await replace_contents(db, item.id, payload.contents)
     await db.commit()
     await db.refresh(item)
+    if item.stock >= 0:
+        try:
+            await redis.sync_stock(item.id, item.stock)
+        except Exception:  # stock sync is best-effort; never fail the main write
+            logger.exception("admin_sync_stock_failed", extra={"product_id": item.id})
     return product_dict(item, await product_contents(db, item.id, True))
 
 
@@ -680,7 +708,7 @@ async def admin_study_orders(db: AsyncSession = Depends(get_db)):
 async def admin_commerce_orders(db: AsyncSession = Depends(get_db)) -> list[OrderOut]:
     """List all standard commerce orders for platform administrators."""
     orders = list(await db.scalars(select(CommerceOrder).order_by(CommerceOrder.id.desc())))
-    return [await commerce_order_out(db, order) for order in orders]
+    return await commerce_orders_out_batch(db, orders)
 
 
 @router.get("/merchant/study/products")
@@ -735,6 +763,11 @@ async def merchant_update_product(
     await replace_contents(db, item.id, payload.contents)
     await db.commit()
     await db.refresh(item)
+    if item.stock >= 0:
+        try:
+            await redis.sync_stock(item.id, item.stock)
+        except Exception:  # stock sync is best-effort; never fail the main write
+            logger.exception("merchant_sync_stock_failed", extra={"product_id": item.id})
     return product_dict(item, await product_contents(db, item.id, True))
 
 
@@ -851,9 +884,10 @@ async def merchant_commerce_orders(school: SchoolSite = Depends(get_current_scho
             .order_by(CommerceOrder.id.desc())
         )
     )
+    items_map = await OrderService.get_order_items_map(db, [order.id for order in orders])
     result: list[OrderOut] = []
     for order in orders:
-        items = await OrderService.get_order_items(db, order.id)
+        items = items_map.get(order.id, [])
         if any(item.school_id == school.id for item in items):
             result.append(OrderOut.model_validate({**order.__dict__, "items": items}))
     return result

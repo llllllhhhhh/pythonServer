@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -15,13 +15,17 @@ from app.core.cache import cache_delete
 from app.core.config import settings
 from app.core.contract_settings import get_contract_template, save_contract_template
 from app.core.database import get_db
+from app.core.exceptions import BusinessError
 from app.core.identity import resolve_user_identities, resolve_user_identity
-from app.core.order_status import TravelContractStatus, TravelFulfillmentStatus
+from app.core.order_status import CommerceOrderStatus, CommercePaymentStatus, TravelContractStatus, TravelFulfillmentStatus, TravelOrderStatus
 from app.core.security import require_admin
 from app.core.slider_captcha import get_slider_captcha_settings, save_slider_captcha_settings
+from app.core.snowflake import SnowflakeGenerator
 from app.core.travel_match_settings import get_travel_match_settings, save_travel_match_settings
 from app.core.upload_settings import get_upload_setting, save_upload_setting
 from app.models import (
+    CommerceOrder,
+    CommerceOrderItem,
     ContentArticle,
     DecorationConfig,
     GraduationCertification,
@@ -37,6 +41,7 @@ from app.models import (
     TravelVerificationRecord,
     UploadedAsset,
     UserAccount,
+    UserEntitlement,
     UserSession,
     WalletTransaction,
 )
@@ -130,7 +135,7 @@ def build_school_out(item: SchoolSite) -> SchoolSiteOut:
 @router.get("/dashboard")
 async def dashboard(db: AsyncSession = Depends(get_db)):
     routes = await db.scalar(select(func.count(TravelRoute.id)))
-    pending_orders = await db.scalar(select(func.count(TravelOrder.id)).where(TravelOrder.status == 0))
+    pending_orders = await db.scalar(select(func.count(TravelOrder.id)).where(TravelOrder.status == int(TravelOrderStatus.CREATED)))
     abnormal_invites = await db.scalar(select(func.count(InviteRelation.id)).where(InviteRelation.abnormal.is_(True)))
     total_users = await db.scalar(select(func.count(UserAccount.id)).where(UserAccount.role == "user"))
     return {
@@ -970,6 +975,66 @@ async def freeze_invite(invite_id: int, db: AsyncSession = Depends(get_db)):
     return item
 
 
+@router.post("/invites/backfill-rewards")
+async def backfill_invite_rewards(db: AsyncSession = Depends(get_db)):
+    """Grant invite points for pending, valid invite relations.
+
+    Covers the case where a registration was approved while the invite point
+    rule was disabled: the relation stays score_granted=false and is picked up
+    here once the rule is re-enabled. Idempotency is guaranteed by the
+    credit_locked idempotency key (invite-reward:{relation.id}).
+    """
+    rule = await db.get(PointRule, 1)
+    invite_enabled = bool((rule.enabled and rule.invite_enabled) if rule else True)
+    invite_score = int(rule.invite_score if rule else 1)
+    if not invite_enabled or invite_score <= 0:
+        return {"ok": True, "granted": 0, "skipped": 0, "reason": "rule_disabled"}
+
+    relations = list(
+        await db.scalars(
+            select(InviteRelation).where(
+                InviteRelation.score_granted.is_(False),
+                InviteRelation.abnormal.is_(False),
+                InviteRelation.frozen.is_(False),
+            )
+        )
+    )
+    granted = 0
+    skipped = 0
+    for relation in relations:
+        invitee = await db.scalar(select(UserAccount).where(UserAccount.phone == relation.invitee_phone))
+        if not invitee or not invitee.is_registered or invitee.status != "active":
+            skipped += 1
+            continue
+        inviter = await db.scalar(
+            select(UserAccount).where(
+                UserAccount.user_no == relation.inviter_id,
+                UserAccount.role == "user",
+                UserAccount.status == "active",
+            )
+        )
+        if not inviter:
+            skipped += 1
+            continue
+        inviter = await PointService.lock_user(db, inviter.id)
+        valid_days = max(1, int(rule.valid_days if rule else 365))
+        await PointService.credit_locked(
+            db,
+            inviter,
+            invite_score,
+            biz_type="invite_reward",
+            biz_id=relation.id,
+            biz_no=str(relation.id),
+            idempotency_key=f"invite-reward:{relation.id}",
+            remark=f"补发邀请积分（{relation.invitee_phone}）",
+            expires_at=datetime.now() + timedelta(days=valid_days),
+        )
+        relation.score_granted = True
+        granted += 1
+    await db.commit()
+    return {"ok": True, "granted": granted, "skipped": skipped, "reason": "ok"}
+
+
 @router.get("/users", response_model=AdminUsersResponse)
 async def users(registered_only: bool = False, db: AsyncSession = Depends(get_db)):
     query = select(UserAccount).order_by(UserAccount.created_at.desc())
@@ -1310,6 +1375,76 @@ async def image_assets(
     if storage:
         query = query.where(UploadedAsset.storage == storage)
     return list(await db.scalars(query))
+
+
+@router.post("/commerce/orders/{order_no}/refund")
+async def refund_commerce_order(
+    order_no: str,
+    admin_user: UserAccount = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Refund a paid standard commerce order to the user's wallet.
+
+    Idempotent: repeated refunds of the same order return the same result.
+    Refunding moves the order to payment_status=refunded, restores the wallet
+    balance, records a wallet transaction and expires the granted entitlements.
+    """
+    locked_order = await db.scalar(
+        select(CommerceOrder).where(CommerceOrder.order_no == order_no).with_for_update()
+    )
+    if not locked_order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if locked_order.payment_status == CommercePaymentStatus.REFUNDED:
+        return {"ok": True, "order_no": order_no, "status": "refunded", "amount": str(locked_order.payable_amount)}
+    if locked_order.payment_status != CommercePaymentStatus.PAID or locked_order.status != CommerceOrderStatus.PAID:
+        raise BusinessError("仅已支付订单可以退款", status_code=400, code="ORDER_NOT_REFUNDABLE")
+
+    user = await db.scalar(select(UserAccount).where(UserAccount.id == locked_order.user_id).with_for_update())
+    if not user:
+        raise BusinessError("用户不存在", status_code=404, code="USER_NOT_FOUND")
+
+    amount = Decimal(locked_order.payable_amount or 0).quantize(Decimal("0.01"))
+    before = Decimal(user.balance or 0).quantize(Decimal("0.01"))
+    transaction_no = SnowflakeGenerator(settings.snowflake_worker_id, settings.snowflake_datacenter_id).next_order_no("WT")
+    user.balance = before + amount
+    db.add(
+        WalletTransaction(
+            user_id=user.id,
+            user_no=user.user_no,
+            transaction_no=transaction_no,
+            direction="income",
+            amount=amount,
+            balance_before=before,
+            balance_after=before + amount,
+            biz_type="refund",
+            biz_id=locked_order.id,
+            biz_no=locked_order.order_no,
+            remark="平台退款",
+        )
+    )
+
+    entitlements = list(
+        await db.scalars(
+            select(UserEntitlement)
+            .where(UserEntitlement.order_id == locked_order.id)
+            .with_for_update()
+        )
+    )
+    for entitlement in entitlements:
+        entitlement.status = "expired"
+
+    locked_order.payment_status = CommercePaymentStatus.REFUNDED
+    locked_order.status = CommerceOrderStatus.CANCELED
+    locked_order.cancel_reason = "平台退款"
+    locked_order.canceled_at = datetime.now()
+    await db.commit()
+    return {
+        "ok": True,
+        "order_no": order_no,
+        "status": "refunded",
+        "amount": str(amount),
+        "refunded_by": admin_user.id,
+    }
 
 
 async def backfill_local_image_assets(db: AsyncSession) -> None:

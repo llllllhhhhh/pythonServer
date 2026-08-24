@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, Numeric, String, Text, UniqueConstraint, func
@@ -394,6 +394,10 @@ class ContentArticle(Base, TimestampMixin):
 
 class SchoolSite(Base, TimestampMixin):
     __tablename__ = "school_sites"
+    __table_args__ = (
+        UniqueConstraint("merchant_account", name="uq_school_sites_merchant_account"),
+        UniqueConstraint("name", "city", name="uq_school_sites_name_city"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(160), index=True)
@@ -547,6 +551,7 @@ class CommerceOrder(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     idempotency_key: Mapped[str] = mapped_column(String(120), default="", index=True)
     transaction_id: Mapped[str] = mapped_column(String(100), default="")
+    timeout_job_scheduled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     canceled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     cancel_reason: Mapped[str] = mapped_column(String(255), default="")

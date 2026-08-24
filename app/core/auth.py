@@ -47,7 +47,7 @@ def generate_token() -> str:
 
 
 def generate_user_no(prefix: str = "U") -> str:
-    return f"{prefix}{datetime.now().strftime('%Y%m%d%H%M%S')}{secrets.randbelow(900) + 100}"
+    return f"{prefix}{datetime.now().strftime('%Y%m%d%H%M%S')}{secrets.randbelow(9000) + 1000}"
 
 
 def session_expire_at(days: int = 30) -> datetime:

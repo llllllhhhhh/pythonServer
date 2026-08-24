@@ -147,9 +147,14 @@ class OrderService:
         if not locked_order:
             raise BusinessError("订单不存在", status_code=404, code="ORDER_NOT_FOUND")
         order = locked_order
-        if order.payment_status == CommercePaymentStatus.PAID:
+        # Idempotent replay of an already-paid order is the normal case for
+        # retries; only inconsistent rows (paid + canceled, or non-pending
+        # statuses) are rejected.
+        if order.payment_status == CommercePaymentStatus.PAID and order.status == CommerceOrderStatus.PAID:
             return order
         if order.status != CommerceOrderStatus.PENDING:
+            raise BusinessError("订单当前状态不可支付", status_code=400, code="ORDER_NOT_PAYABLE")
+        if order.payment_status == CommercePaymentStatus.PAID:
             raise BusinessError("订单当前状态不可支付", status_code=400, code="ORDER_NOT_PAYABLE")
 
         order.payment_status = CommercePaymentStatus.PAID
@@ -215,6 +220,8 @@ class OrderService:
         if not locked_user:
             raise BusinessError("用户不存在", status_code=404, code="USER_NOT_FOUND")
         amount = Decimal(locked_order.payable_amount or 0).quantize(Decimal("0.01"))
+        if amount < 0:
+            raise BusinessError("订单金额异常", status_code=400, code="INVALID_ORDER_AMOUNT")
         before = Decimal(locked_user.balance or 0).quantize(Decimal("0.01"))
         if before < amount:
             raise BusinessError("余额不足，请先充值后再购买", status_code=400, code="INSUFFICIENT_BALANCE")
@@ -284,12 +291,17 @@ class OrderService:
                 item.status = CommerceOrderStatus.CANCELED
                 continue
             product = products.get(item.product_id)
-            if product and product.stock >= 0:
+            restored_db = bool(product and product.stock >= 0)
+            if restored_db:
                 product.stock += item.quantity
-            try:
-                await redis.incr_stock(item.product_id, item.quantity)
-            except RedisUnavailableError:
-                logger.exception("redis_restore_stock_failed", extra={"order_no": order.order_no, "product_id": item.product_id})
+            if restored_db:
+                # Keep Redis aligned with MySQL: only restore Redis when the
+                # database restore actually happened, otherwise the two stores
+                # drift permanently.
+                try:
+                    await redis.incr_stock(item.product_id, item.quantity)
+                except RedisUnavailableError:
+                    logger.exception("redis_restore_stock_failed", extra={"order_no": order.order_no, "product_id": item.product_id})
             item.stock_deducted = False
             item.status = CommerceOrderStatus.CANCELED
 
@@ -305,6 +317,26 @@ class OrderService:
     async def get_order_items(db: AsyncSession, order_id: int) -> list[CommerceOrderItem]:
         """Return all items of an order."""
         return list(await db.scalars(select(CommerceOrderItem).where(CommerceOrderItem.order_id == order_id).order_by(CommerceOrderItem.id)))
+
+    @staticmethod
+    async def get_order_items_map(db: AsyncSession, order_ids: list[int]) -> dict[int, list[CommerceOrderItem]]:
+        """Batch-load items for many orders to avoid N+1 queries.
+
+        Returns a mapping of order_id -> items sorted by item id.
+        """
+        if not order_ids:
+            return {}
+        rows = list(
+            await db.scalars(
+                select(CommerceOrderItem)
+                .where(CommerceOrderItem.order_id.in_(order_ids))
+                .order_by(CommerceOrderItem.id)
+            )
+        )
+        result: dict[int, list[CommerceOrderItem]] = {}
+        for item in rows:
+            result.setdefault(item.order_id, []).append(item)
+        return result
 
     @staticmethod
     async def get_order_by_no(db: AsyncSession, order_no: str) -> CommerceOrder | None:
@@ -340,6 +372,8 @@ class OrderService:
         """Persist order header, item rows and MySQL stock deduction."""
         order_no = snowflake.next_order_no("XO")
         total_amount = sum((Decimal(products[pid].price) * quantity for pid, quantity in quantity_map.items()), Decimal("0.00"))
+        if total_amount < 0:
+            raise BusinessError("订单金额异常", status_code=400, code="INVALID_ORDER_AMOUNT")
         school_ids = {products[pid].school_id for pid in quantity_map}
         order = CommerceOrder(
             order_no=order_no,

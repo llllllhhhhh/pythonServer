@@ -12,6 +12,20 @@ from app.core.order_status import (
 )
 
 
+def validate_travel_date(value: str) -> str:
+    """Validate a travel date in YYYY-MM-DD or YYYY/MM/DD form; empty allowed."""
+    text = (value or "").strip()
+    if not text:
+        return text
+    for pattern in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            datetime.strptime(text, pattern)
+            return text
+        except ValueError:
+            continue
+    raise ValueError("出行日期格式应为 YYYY-MM-DD")
+
+
 class DecorationPayload(BaseModel):
     brand: dict[str, Any]
     pages: list[dict[str, Any]]
@@ -262,6 +276,11 @@ class OrderOut(BaseModel):
 class RouteExchangePayload(BaseModel):
     travel_date: str = Field(default="", max_length=30)
 
+    @field_validator("travel_date")
+    @classmethod
+    def _validate_travel_date(cls, value: str) -> str:
+        return validate_travel_date(value)
+
 
 class ContractTemplatePayload(BaseModel):
     title: str = Field(default="旅行服务合同", min_length=1, max_length=120)
@@ -283,6 +302,11 @@ class ContractSignPayload(BaseModel):
     id_no: str = Field(min_length=1, max_length=40)
     travel_date: str = Field(min_length=1, max_length=30)
     signature_data: str = Field(min_length=60, max_length=500000)
+
+    @field_validator("travel_date")
+    @classmethod
+    def _validate_sign_travel_date(cls, value: str) -> str:
+        return validate_travel_date(value)
 
 
 class ContractReviewPayload(BaseModel):

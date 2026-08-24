@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import case, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError
@@ -70,7 +71,14 @@ class PointService:
         )
         user.points = after
         db.add(ledger)
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            existing = await cls.find_ledger(db, user.id, idempotency_key)
+            if existing:
+                return existing
+            raise
         db.add(
             PointLot(
                 user_id=user.id,
@@ -329,7 +337,7 @@ class PointService:
             biz_type="legacy_opening",
             biz_id=user.id,
             biz_no=user.user_no,
-            idempotency_key=f"legacy-opening:{user.id}:{covered}:{balance}",
+            idempotency_key=f"legacy-opening:{user.id}",
             remark="历史积分期初余额",
         )
         db.add(ledger)

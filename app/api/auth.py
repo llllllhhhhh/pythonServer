@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import generate_token, generate_user_no, hash_password, session_expire_at, verify_and_rehash_password
@@ -162,7 +163,25 @@ async def register(payload: RegisterPayload, db: AsyncSession = Depends(get_db))
         points=0,
     )
     db.add(user)
-    await db.flush()
+    for _ in range(3):
+        try:
+            await db.flush()
+            break
+        except IntegrityError:
+            await db.rollback()
+            user = UserAccount(
+                user_no=generate_user_no(),
+                phone=payload.phone,
+                nickname=payload.nickname or "小徒同学",
+                password_hash=hash_password(payload.password),
+                role="user",
+                status="pending",
+                is_registered=False,
+                points=0,
+            )
+            db.add(user)
+    else:
+        raise HTTPException(status_code=500, detail="注册失败，请稍后重试")
     invitation_bound = False
     invite_code = payload.invite_code.strip()
     if invite_code:
@@ -290,7 +309,26 @@ async def wechat_mini_login(
             points=0,
         )
         db.add(user)
-        await db.flush()
+        for _ in range(3):
+            try:
+                await db.flush()
+                break
+            except IntegrityError:
+                await db.rollback()
+                user = UserAccount(
+                    user_no=generate_user_no(),
+                    phone=phone,
+                    wechat_openid=openid,
+                    nickname=phone,
+                    password_hash=hash_password(secrets.token_urlsafe(32)),
+                    role="user",
+                    status="active",
+                    is_registered=True,
+                    points=0,
+                )
+                db.add(user)
+        else:
+            raise HTTPException(status_code=500, detail="登录失败，请稍后重试")
 
     invite_code = payload.invite_code.strip()
     if created and invite_code:

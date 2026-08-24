@@ -1,3 +1,4 @@
+import hashlib
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -10,6 +11,7 @@ from app.core.cache import cache_get_json, cache_set_json
 from app.core.asset_access import is_public_asset_source, verify_asset_access_token
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.security import get_current_user
 from app.core.storage import load_upload_bytes
 from app.core.travel_match_settings import get_travel_match_settings
 from app.core.upload_settings import get_upload_setting
@@ -300,8 +302,23 @@ async def public_travel_match_settings(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/preferences/events", status_code=201)
-async def record_preference(payload: PreferenceEventPayload, db: AsyncSession = Depends(get_db)):
-    event = PreferenceEvent(**payload.model_dump())
+async def record_preference(
+    payload: PreferenceEventPayload,
+    current_user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Require login and pin the identity server-side so anonymous callers
+    # cannot fabricate preference data for other users. user_id is stored as
+    # str(user.id) to stay consistent with onboarding events (see commerce.py).
+    event = PreferenceEvent(
+        user_id=str(current_user.id),
+        user_name=payload.user_name or current_user.nickname or "学徒行同学",
+        preference_type=payload.preference_type,
+        target_key=payload.target_key,
+        target_name=payload.target_name,
+        action=payload.action,
+        score=payload.score,
+    )
     db.add(event)
     await db.commit()
     return {"ok": True, "id": event.id}
@@ -362,8 +379,9 @@ async def public_asset_object_thumb(
     public = await _authorize_asset(asset, request, db, "object-thumb", asset_token)
     cache_dir = Path(settings.upload_dir) / ".thumb-cache" / "objects"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"{abs(hash(object_key))}.jpg"
-    cache_key = f"object-thumb-{abs(hash(object_key))}"
+    object_hash = hashlib.sha256(object_key.encode("utf-8")).hexdigest()
+    cache_file = cache_dir / f"{object_hash}.jpg"
+    cache_key = f"object-thumb-{object_hash}"
     if cache_file.exists():
         return image_response(cache_file.read_bytes(), "image/jpeg", cache_key, public)
     loaded = await load_upload_bytes_with_fallback(asset.object_key, asset.storage)

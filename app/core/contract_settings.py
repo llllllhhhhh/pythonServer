@@ -1,9 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import date, timedelta
 import hashlib
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import ContractTemplateSnapshot, SystemSetting
@@ -104,7 +105,26 @@ async def ensure_contract_template_snapshot(db: AsyncSession, template: dict | N
         content_hash=content_hash,
     )
     db.add(snapshot)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # A concurrent save computed the same next version; reload the
+        # matching snapshot instead of failing or duplicating versions.
+        await db.rollback()
+        existing = await db.scalar(
+            select(ContractTemplateSnapshot).where(ContractTemplateSnapshot.content_hash == content_hash)
+        )
+        if existing:
+            return existing
+        snapshot = ContractTemplateSnapshot(
+            version=int(await db.scalar(select(func.max(ContractTemplateSnapshot.version))) or 0) + 1,
+            title=normalized["title"],
+            content=normalized["content"],
+            travel_date_days=normalized["travel_date_days"],
+            content_hash=content_hash,
+        )
+        db.add(snapshot)
+        await db.flush()
     return snapshot
 
 

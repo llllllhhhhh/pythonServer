@@ -1,7 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import delete, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import generate_token, hash_password, session_expire_at, verify_and_rehash_password
@@ -48,8 +49,11 @@ async def get_current_school(
     school = await db.get(SchoolSite, session.school_id)
     if not school or school.review_status != "approved" or not school.status:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="学校未审核通过或已下架")
-    session.last_seen_at = datetime.now()
-    await db.commit()
+    # Throttle last_seen_at writes to once per 5 minutes per session to avoid
+    # a write + commit on every read-path request.
+    if session.last_seen_at is None or (datetime.now() - session.last_seen_at) > timedelta(minutes=5):
+        session.last_seen_at = datetime.now()
+        await db.commit()
     return school
 
 
@@ -80,7 +84,11 @@ async def apply_school(payload: SchoolApplicationPayload, db: AsyncSession = Dep
         merchant_password_hash=hash_password(payload.merchant_password),
     )
     db.add(item)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="该学校或商户账号已提交过入驻申请")
     return SchoolApplicationResponse(message="入驻申请已提交，请等待平台审核", status="pending")
 
 
