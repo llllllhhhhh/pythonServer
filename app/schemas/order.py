@@ -22,6 +22,10 @@ class OrderCreateRequest(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=120)
 
 
+class RefundRequest(BaseModel):
+    reason: str = Field(default="用户申请退款", min_length=2, max_length=255)
+
+
 class OrderItemOut(BaseModel):
     """Order item response model."""
 
@@ -61,7 +65,9 @@ class OrderOut(BaseModel):
     refund_no: str | None = None
     refund_id: str = ""
     refund_status: str = ""
+    refund_reason: str = ""
     paid_at: datetime | None
+    refund_requested_at: datetime | None = None
     refunded_at: datetime | None = None
     canceled_at: datetime | None
     cancel_reason: str

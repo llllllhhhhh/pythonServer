@@ -25,7 +25,7 @@ from app.schemas.commerce import (
     StudyProductPayload,
     StudyProductReviewPayload,
 )
-from app.schemas.order import OrderCreateRequest, OrderOut
+from app.schemas.order import OrderCreateRequest, OrderOut, RefundRequest
 from app.services.order_service import OrderService
 from app.services.point_service import PointService
 from app.services.wechat_pay_service import (
@@ -227,6 +227,32 @@ async def standard_order_detail(
     order = await OrderService.get_order_by_no(db, order_no)
     if not order or order.user_id != user.id:
         raise HTTPException(status_code=404, detail="订单不存在")
+    return await commerce_order_out(db, order)
+
+
+@router.post("/commerce/standard-orders/{order_no}/refund/request", response_model=OrderOut)
+async def request_standard_order_refund(
+    order_no: str,
+    payload: RefundRequest,
+    user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> OrderOut:
+    order = await db.scalar(
+        select(CommerceOrder).where(CommerceOrder.order_no == order_no).with_for_update()
+    )
+    if not order or order.user_id != user.id:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.payment_status == CommercePaymentStatus.REFUNDED:
+        return await commerce_order_out(db, order)
+    if order.refund_status in {"requested", "processing"}:
+        return await commerce_order_out(db, order)
+    if order.payment_status != CommercePaymentStatus.PAID or order.status != "paid":
+        raise BusinessError("仅已支付订单可以申请退款", status_code=400, code="ORDER_NOT_REFUNDABLE")
+    order.refund_status = "requested"
+    order.refund_reason = payload.reason.strip()
+    order.refund_requested_at = datetime.now()
+    await db.commit()
+    await db.refresh(order)
     return await commerce_order_out(db, order)
 
 

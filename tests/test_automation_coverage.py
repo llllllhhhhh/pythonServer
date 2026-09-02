@@ -26,6 +26,7 @@ from app.api.admin import (
 )
 from app.api.commerce import (
     merchant_create_product,
+    request_standard_order_refund,
     review_product,
     sync_wechat_standard_order,
     wechat_pay_notification,
@@ -74,7 +75,7 @@ from app.schemas.api import (
     WalletAdjustPayload,
 )
 from app.schemas.commerce import StudyProductPayload, StudyProductReviewPayload
-from app.schemas.order import OrderCreateItem, OrderCreateRequest
+from app.schemas.order import OrderCreateItem, OrderCreateRequest, RefundRequest
 from app.services.order_service import OrderService
 
 
@@ -310,6 +311,21 @@ class StandardOrderAutomationTests(DatabaseTestCase):
             await OrderService.mark_order_paid(
                 self.db, order, payment_method="wechat", transaction_id="WX-REFUND-TX-001"
             )
+        requested = await request_standard_order_refund(
+            order.order_no,
+            RefundRequest(reason="用户测试退款申请"),
+            user=user,
+            db=self.db,
+        )
+        repeated_request = await request_standard_order_refund(
+            order.order_no,
+            RefundRequest(reason="重复提交不应覆盖"),
+            user=user,
+            db=self.db,
+        )
+        self.assertEqual("requested", requested.refund_status)
+        self.assertEqual("requested", repeated_request.refund_status)
+        self.assertEqual("用户测试退款申请", repeated_request.refund_reason)
         with patch(
             "app.api.admin.create_wechat_refund",
             new=AsyncMock(
