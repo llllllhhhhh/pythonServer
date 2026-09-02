@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     wechat_mch_id: str = ""
     wechat_api_v3_key: str = ""
     wechat_notify_url: str = ""
+    wechat_refund_notify_url: str = ""
     wechat_merchant_serial_no: str = ""
     wechat_merchant_private_key_path: str = ""
     wechat_pay_public_key_id: str = ""
@@ -108,6 +109,14 @@ class Settings(BaseSettings):
     @property
     def trusted_proxy_list(self) -> list[str]:
         return [item.strip() for item in self.trusted_proxy_ips.split(",") if item.strip()]
+
+    @property
+    def resolved_wechat_refund_notify_url(self) -> str:
+        if self.wechat_refund_notify_url:
+            return self.wechat_refund_notify_url
+        if self.wechat_notify_url.endswith("/notify"):
+            return f"{self.wechat_notify_url[:-len('/notify')]}/refund-notify"
+        return ""
 
     @property
     def database_url(self) -> URL:

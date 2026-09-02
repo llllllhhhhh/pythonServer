@@ -35,6 +35,60 @@ class PointService:
         )
 
     @classmethod
+    async def revoke_credit_locked(
+        cls,
+        db: AsyncSession,
+        user: UserAccount,
+        *,
+        credit_idempotency_key: str,
+        reversal_idempotency_key: str,
+        biz_type: str,
+        biz_id: int = 0,
+        biz_no: str = "",
+        remark: str = "",
+    ) -> PointLedger | None:
+        """Remove the unspent remainder of an earlier point credit.
+
+        A refund must never fail merely because the user has already consumed
+        reward points. Only the source lot's remaining amount is revoked.
+        """
+        existing = await cls.find_ledger(db, user.id, reversal_idempotency_key)
+        if existing:
+            return existing
+        original = await cls.find_ledger(db, user.id, credit_idempotency_key)
+        if not original or original.direction != "income":
+            return None
+        lot = await db.scalar(
+            select(PointLot)
+            .where(PointLot.source_ledger_id == original.id)
+            .with_for_update()
+        )
+        if not lot or lot.status == "revoked":
+            return None
+        amount = min(int(lot.remaining_amount or 0), int(user.points or 0))
+        lot.remaining_amount = max(0, int(lot.remaining_amount or 0) - amount)
+        lot.status = "revoked" if lot.remaining_amount == 0 else lot.status
+        if amount <= 0:
+            lot.status = "revoked"
+            return None
+        before = int(user.points or 0)
+        ledger = cls._ledger(
+            user,
+            direction="expense",
+            amount=amount,
+            balance_before=before,
+            balance_after=before - amount,
+            biz_type=biz_type,
+            biz_id=biz_id,
+            biz_no=biz_no,
+            idempotency_key=reversal_idempotency_key,
+            remark=remark,
+        )
+        user.points = before - amount
+        db.add(ledger)
+        return ledger
+
+    @classmethod
     async def credit_locked(
         cls,
         db: AsyncSession,

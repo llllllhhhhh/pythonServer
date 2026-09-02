@@ -58,7 +58,11 @@ class OrderOut(BaseModel):
     payment_status: str
     status: str
     transaction_id: str
+    refund_no: str | None = None
+    refund_id: str = ""
+    refund_status: str = ""
     paid_at: datetime | None
+    refunded_at: datetime | None = None
     canceled_at: datetime | None
     cancel_reason: str
     created_at: datetime

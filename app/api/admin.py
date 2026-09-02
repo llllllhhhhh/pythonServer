@@ -26,7 +26,6 @@ from app.core.travel_match_settings import get_travel_match_settings, save_trave
 from app.core.upload_settings import get_upload_setting, save_upload_setting
 from app.models import (
     CommerceOrder,
-    CommerceOrderItem,
     ContentArticle,
     DecorationConfig,
     GraduationCertification,
@@ -92,11 +91,17 @@ from app.schemas.api import (
     TravelPickupSchedulePayload,
 )
 from app.services.point_service import PointService
+from app.services.order_service import OrderService
 from app.services.travel_order_service import (
     add_travel_audit,
     add_verification_record,
     cancel_travel_order,
     qr_expiry,
+)
+from app.services.wechat_pay_service import (
+    create_refund as create_wechat_refund,
+    query_refund as query_wechat_refund,
+    validate_refund_result,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
@@ -1388,12 +1393,7 @@ async def refund_commerce_order(
     admin_user: UserAccount = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Refund a paid standard commerce order to the user's wallet.
-
-    Idempotent: repeated refunds of the same order return the same result.
-    Refunding moves the order to payment_status=refunded, restores the wallet
-    balance, records a wallet transaction and expires the granted entitlements.
-    """
+    """Refund a paid standard order through its original payment channel."""
     locked_order = await db.scalar(
         select(CommerceOrder).where(CommerceOrder.order_no == order_no).with_for_update()
     )
@@ -1401,88 +1401,72 @@ async def refund_commerce_order(
         raise HTTPException(status_code=404, detail="订单不存在")
     if locked_order.payment_status == CommercePaymentStatus.REFUNDED:
         return {"ok": True, "order_no": order_no, "status": "refunded", "amount": str(locked_order.payable_amount)}
+    if locked_order.refund_status == "processing" and locked_order.payment_method == "wechat":
+        result = await query_wechat_refund(locked_order.refund_no or "")
+        provider_status, provider_refund_id = validate_refund_result(
+            locked_order,
+            result,
+            locked_order.refund_no or "",
+        )
+        if provider_status == "SUCCESS":
+            locked_order = await OrderService.finalize_refund(
+                db,
+                locked_order,
+                refund_no=locked_order.refund_no or "",
+                refund_id=provider_refund_id,
+                wallet_refund=False,
+            )
+        else:
+            locked_order.refund_status = provider_status.lower()
+            locked_order.refund_id = provider_refund_id
+            await db.commit()
+        return {
+            "ok": True,
+            "order_no": order_no,
+            "status": locked_order.refund_status,
+            "amount": str(locked_order.payable_amount),
+        }
     if locked_order.payment_status != CommercePaymentStatus.PAID or locked_order.status != CommerceOrderStatus.PAID:
         raise BusinessError("仅已支付订单可以退款", status_code=400, code="ORDER_NOT_REFUNDABLE")
-
-    user = await db.scalar(select(UserAccount).where(UserAccount.id == locked_order.user_id).with_for_update())
-    if not user:
-        raise BusinessError("用户不存在", status_code=404, code="USER_NOT_FOUND")
-
-    amount = Decimal(locked_order.payable_amount or 0).quantize(Decimal("0.01"))
-    before = Decimal(user.balance or 0).quantize(Decimal("0.01"))
-    transaction_no = SnowflakeGenerator(settings.snowflake_worker_id, settings.snowflake_datacenter_id).next_order_no("WT")
-    user.balance = before + amount
-    db.add(
-        WalletTransaction(
-            user_id=user.id,
-            user_no=user.user_no,
-            transaction_no=transaction_no,
-            direction="income",
-            amount=amount,
-            balance_before=before,
-            balance_after=before + amount,
-            biz_type="refund",
-            biz_id=locked_order.id,
-            biz_no=locked_order.order_no,
-            remark="平台退款",
-        )
-    )
-
-    entitlements = list(
-        await db.scalars(
-            select(UserEntitlement)
-            .where(UserEntitlement.order_id == locked_order.id)
-            .with_for_update()
-        )
-    )
-    for entitlement in entitlements:
-        entitlement.status = "expired"
-
-    # Restore stock for finite-stock products, mirroring cancel_unpaid_order:
-    # only when the database row is actually restored do we also restore Redis,
-    # so the two stores stay aligned.
-    items = list(
-        await db.scalars(
-            select(CommerceOrderItem)
-            .where(CommerceOrderItem.order_id == locked_order.id)
-            .order_by(CommerceOrderItem.id)
-        )
-    )
-    product_ids = {item.product_id for item in items if item.stock_deducted}
-    if product_ids:
-        products = {
-            product.id: product
-            for product in list(
-                await db.scalars(
-                    select(StudyProduct)
-                    .where(StudyProduct.id.in_(product_ids))
-                    .with_for_update()
-                )
+    refund_no = locked_order.refund_no or SnowflakeGenerator(
+        settings.snowflake_worker_id, settings.snowflake_datacenter_id
+    ).next_order_no("RF")
+    if locked_order.payment_method == "wechat":
+        result = await create_wechat_refund(locked_order, refund_no)
+        provider_status_raw, provider_refund_id = validate_refund_result(locked_order, result, refund_no)
+        provider_status = provider_status_raw.lower()
+        locked_order.refund_no = refund_no
+        locked_order.refund_id = provider_refund_id
+        locked_order.refund_status = provider_status
+        if provider_status == "success":
+            locked_order = await OrderService.finalize_refund(
+                db,
+                locked_order,
+                refund_no=refund_no,
+                refund_id=locked_order.refund_id,
+                wallet_refund=False,
             )
+        else:
+            await db.commit()
+        return {
+            "ok": True,
+            "order_no": order_no,
+            "status": locked_order.refund_status,
+            "amount": str(locked_order.payable_amount),
+            "refunded_by": admin_user.id,
         }
-        for item in items:
-            if not item.stock_deducted:
-                continue
-            product = products.get(item.product_id)
-            restored_db = bool(product and product.stock >= 0)
-            if restored_db:
-                product.stock += item.quantity
-                try:
-                    await redis.incr_stock(item.product_id, item.quantity)
-                except Exception:  # best-effort; keep the refund itself working
-                    logger.exception("refund_redis_restore_failed", extra={"product_id": item.product_id})
-            item.stock_deducted = False
 
-    locked_order.payment_status = CommercePaymentStatus.REFUNDED
-    locked_order.status = CommerceOrderStatus.CANCELED
-    locked_order.cancel_reason = "平台退款"
-    locked_order.canceled_at = datetime.now()
-    await db.commit()
+    locked_order = await OrderService.finalize_refund(
+        db,
+        locked_order,
+        refund_no=refund_no,
+        wallet_refund=locked_order.payment_method == "balance",
+    )
     return {
         "ok": True,
         "order_no": order_no,
         "status": "refunded",
-        "amount": str(amount),
+        "amount": str(locked_order.payable_amount),
         "refunded_by": admin_user.id,
     }
 

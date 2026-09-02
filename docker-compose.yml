@@ -8,6 +8,7 @@ x-app-environment: &app-environment
   WECHAT_MCH_ID: ${WECHAT_MCH_ID:-}
   WECHAT_API_V3_KEY: ${WECHAT_API_V3_KEY:-}
   WECHAT_NOTIFY_URL: ${WECHAT_NOTIFY_URL:-}
+  WECHAT_REFUND_NOTIFY_URL: ${WECHAT_REFUND_NOTIFY_URL:-}
   WECHAT_MERCHANT_SERIAL_NO: ${WECHAT_MERCHANT_SERIAL_NO:-}
   WECHAT_MERCHANT_PRIVATE_KEY_PATH: ${WECHAT_MERCHANT_PRIVATE_KEY_PATH:-}
   WECHAT_PAY_PUBLIC_KEY_ID: ${WECHAT_PAY_PUBLIC_KEY_ID:-}
@@ -113,6 +114,7 @@ services:
     environment: *app-environment
     volumes:
       - uploads_data:/app/uploads
+      - ./secrets:/run/secrets/xuetuxing:ro
     depends_on:
       mysql:
         condition: service_healthy

@@ -18,6 +18,7 @@ from app.models import (
     CommerceOrder,
     CommerceOrderItem,
     LearningProfile,
+    PointRule,
     StudyProduct,
     UserAccount,
     UserEntitlement,
@@ -25,6 +26,7 @@ from app.models import (
 )
 from app.schemas.order import OrderCreateRequest
 from app.tasks.order_tasks import enqueue_order_payment_timeout
+from app.services.point_service import PointService
 
 logger = logging.getLogger(__name__)
 snowflake = SnowflakeGenerator(settings.snowflake_worker_id, settings.snowflake_datacenter_id)
@@ -188,6 +190,23 @@ class OrderService:
         if not await db.scalar(select(LearningProfile).where(LearningProfile.user_id == order.user_id)):
             db.add(LearningProfile(user_id=order.user_id))
 
+        rule = await db.get(PointRule, 1)
+        reward = int(rule.purchase_score or 0) if rule and rule.enabled and rule.purchase_enabled else 0
+        if reward > 0:
+            point_user = await PointService.lock_user(db, order.user_id)
+            valid_days = max(1, int(rule.valid_days or 365))
+            await PointService.credit_locked(
+                db,
+                point_user,
+                reward,
+                biz_type="study_purchase",
+                biz_id=order.id,
+                biz_no=order.order_no,
+                idempotency_key=f"standard-purchase:{order.id}",
+                remark="购买学习产品奖励",
+                expires_at=datetime.now() + timedelta(days=valid_days),
+            )
+
         await db.commit()
         await db.refresh(order)
         logger.info("order_paid", extra={"order_no": order.order_no, "user_id": order.user_id})
@@ -266,8 +285,151 @@ class OrderService:
             if not order:
                 logger.warning("cancel_order_not_found", extra={"order_no": order_no})
                 return {"ok": False, "reason": "not_found", "order_no": order_no}
+            if order.payment_method == "wechat":
+                from app.services.wechat_pay_service import (
+                    close_transaction,
+                    is_wechat_pay_configured,
+                    query_transaction,
+                    validate_successful_transaction,
+                )
+
+                if is_wechat_pay_configured():
+                    try:
+                        transaction = await query_transaction(order.order_no)
+                    except BusinessError as exc:
+                        if exc.code != "WECHAT_PAY_ORDER_NOT_EXIST":
+                            logger.exception("wechat_order_query_before_cancel_failed", extra={"order_no": order_no})
+                            return {"ok": False, "reason": "wechat_query_failed", "order_no": order_no}
+                    else:
+                        trade_state = transaction.get("trade_state")
+                        if trade_state == "SUCCESS":
+                            transaction_id = validate_successful_transaction(order, transaction)
+                            await cls.mark_order_paid(
+                                db,
+                                order,
+                                payment_method="wechat",
+                                transaction_id=transaction_id,
+                            )
+                            return {"ok": True, "changed": True, "reason": "wechat_paid", "order_no": order_no}
+                        if trade_state == "USERPAYING":
+                            return {"ok": False, "reason": "wechat_user_paying", "order_no": order_no}
+                        if trade_state == "NOTPAY":
+                            try:
+                                await close_transaction(order.order_no)
+                            except BusinessError:
+                                logger.exception("wechat_order_close_failed", extra={"order_no": order_no})
+                                return {"ok": False, "reason": "wechat_close_failed", "order_no": order_no}
             changed = await cls.cancel_unpaid_order(db, order, reason="支付超时，系统自动取消")
             return {"ok": True, "changed": changed, "order_no": order_no}
+
+    @classmethod
+    async def finalize_refund(
+        cls,
+        db: AsyncSession,
+        order: CommerceOrder,
+        *,
+        refund_no: str,
+        refund_id: str = "",
+        wallet_refund: bool = False,
+    ) -> CommerceOrder:
+        """Apply local side effects only after a refund is confirmed successful."""
+        locked_order = await db.scalar(
+            select(CommerceOrder).where(CommerceOrder.id == order.id).with_for_update()
+        )
+        if not locked_order:
+            raise BusinessError("订单不存在", status_code=404, code="ORDER_NOT_FOUND")
+        if locked_order.payment_status == CommercePaymentStatus.REFUNDED:
+            return locked_order
+        if locked_order.payment_status != CommercePaymentStatus.PAID or locked_order.status != CommerceOrderStatus.PAID:
+            raise BusinessError("仅已支付订单可以退款", status_code=400, code="ORDER_NOT_REFUNDABLE")
+
+        user = await PointService.lock_user(db, locked_order.user_id)
+        if wallet_refund:
+            existing_wallet_refund = await db.scalar(
+                select(WalletTransaction).where(
+                    WalletTransaction.biz_type == "refund",
+                    WalletTransaction.biz_no == locked_order.order_no,
+                )
+            )
+            if not existing_wallet_refund:
+                amount = Decimal(locked_order.payable_amount or 0).quantize(Decimal("0.01"))
+                before = Decimal(user.balance or 0).quantize(Decimal("0.01"))
+                user.balance = before + amount
+                db.add(
+                    WalletTransaction(
+                        user_id=user.id,
+                        user_no=user.user_no,
+                        transaction_no=snowflake.next_order_no("WT"),
+                        direction="income",
+                        amount=amount,
+                        balance_before=before,
+                        balance_after=before + amount,
+                        biz_type="refund",
+                        biz_id=locked_order.id,
+                        biz_no=locked_order.order_no,
+                        remark="平台退款",
+                    )
+                )
+
+        await PointService.revoke_credit_locked(
+            db,
+            user,
+            credit_idempotency_key=f"standard-purchase:{locked_order.id}",
+            reversal_idempotency_key=f"standard-purchase-refund:{locked_order.id}",
+            biz_type="study_purchase_refund",
+            biz_id=locked_order.id,
+            biz_no=locked_order.order_no,
+            remark="订单退款撤销购买奖励积分",
+        )
+
+        entitlements = list(
+            await db.scalars(
+                select(UserEntitlement)
+                .where(UserEntitlement.order_id == locked_order.id)
+                .with_for_update()
+            )
+        )
+        for entitlement in entitlements:
+            entitlement.status = "expired"
+
+        items = await cls.get_order_items(db, locked_order.id)
+        product_ids = {item.product_id for item in items}
+        products = {
+            product.id: product
+            for product in list(
+                await db.scalars(
+                    select(StudyProduct)
+                    .where(StudyProduct.id.in_(product_ids))
+                    .with_for_update()
+                )
+            )
+        }
+        for item in items:
+            product = products.get(item.product_id)
+            if product:
+                product.sales = max(0, int(product.sales or 0) - item.quantity)
+            if item.stock_deducted:
+                restored_db = bool(product and product.stock >= 0)
+                if restored_db:
+                    product.stock += item.quantity
+                    try:
+                        await redis.incr_stock(item.product_id, item.quantity)
+                    except RedisUnavailableError:
+                        logger.exception("refund_redis_restore_failed", extra={"product_id": item.product_id})
+                item.stock_deducted = False
+            item.status = CommerceOrderStatus.CANCELED
+
+        locked_order.refund_no = refund_no
+        locked_order.refund_id = refund_id
+        locked_order.refund_status = "success"
+        locked_order.refunded_at = datetime.now()
+        locked_order.payment_status = CommercePaymentStatus.REFUNDED
+        locked_order.status = CommerceOrderStatus.CANCELED
+        locked_order.cancel_reason = "平台退款"
+        locked_order.canceled_at = locked_order.refunded_at
+        await db.commit()
+        await db.refresh(locked_order)
+        return locked_order
 
     @classmethod
     async def cancel_unpaid_order(cls, db: AsyncSession, order: CommerceOrder, reason: str) -> bool:

@@ -551,8 +551,12 @@ class CommerceOrder(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     idempotency_key: Mapped[str] = mapped_column(String(120), default="", index=True)
     transaction_id: Mapped[str] = mapped_column(String(100), default="")
+    refund_no: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True, index=True)
+    refund_id: Mapped[str] = mapped_column(String(100), default="")
+    refund_status: Mapped[str] = mapped_column(String(20), default="", index=True)
     timeout_job_scheduled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     canceled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     cancel_reason: Mapped[str] = mapped_column(String(255), default="")
 

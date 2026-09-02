@@ -32,6 +32,9 @@ from app.services.wechat_pay_service import (
     create_jsapi_payment,
     decrypt_notification,
     is_wechat_pay_configured,
+    query_transaction,
+    validate_successful_transaction,
+    validate_refund_result,
     verify_notification_signature,
     yuan_to_fen,
 )
@@ -294,6 +297,41 @@ async def wechat_pay_standard_order(
     return {"order_no": order.order_no, "amount": order.payable_amount, **params}
 
 
+async def apply_wechat_payment_result(transaction: dict, db: AsyncSession) -> CommerceOrder:
+    order_no = str(transaction.get("out_trade_no") or "")
+    order = await OrderService.get_order_by_no_for_update(db, order_no)
+    if not order:
+        raise BusinessError("微信支付订单不存在", status_code=404, code="ORDER_NOT_FOUND")
+    transaction_id = validate_successful_transaction(order, transaction)
+    if order.payment_status in {CommercePaymentStatus.PAID, CommercePaymentStatus.REFUNDED}:
+        if order.transaction_id and order.transaction_id != transaction_id:
+            raise BusinessError("微信支付交易号不匹配", status_code=409, code="WECHAT_PAY_ORDER_MISMATCH")
+        return order
+    return await OrderService.mark_order_paid(db, order, payment_method="wechat", transaction_id=transaction_id)
+
+
+@router.post("/commerce/standard-orders/{order_no}/pay/wechat/sync", response_model=OrderOut)
+async def sync_wechat_standard_order(
+    order_no: str,
+    user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> OrderOut:
+    order = await OrderService.get_order_by_no(db, order_no)
+    if not order or order.user_id != user.id:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.payment_status == CommercePaymentStatus.PAID:
+        return await commerce_order_out(db, order)
+    if order.payment_method != "wechat" or order.status != "pending":
+        raise BusinessError("订单当前状态不可同步微信支付", status_code=400, code="ORDER_NOT_PAYABLE")
+    transaction = await query_transaction(order.order_no)
+    trade_state = transaction.get("trade_state")
+    if trade_state == "SUCCESS":
+        order = await apply_wechat_payment_result(transaction, db)
+    elif trade_state in {"CLOSED", "REVOKED", "PAYERROR"}:
+        await OrderService.cancel_unpaid_order(db, order, reason=f"微信支付状态：{trade_state}")
+    return await commerce_order_out(db, order)
+
+
 @router.post("/commerce/wechat/notify")
 async def wechat_pay_notification(request: Request, db: AsyncSession = Depends(get_db)):
     body = await request.body()
@@ -301,25 +339,34 @@ async def wechat_pay_notification(request: Request, db: AsyncSession = Depends(g
     transaction = decrypt_notification(body)
     if transaction.get("trade_state") != "SUCCESS":
         return {"code": "SUCCESS", "message": "成功"}
-    if transaction.get("mchid") != settings.wechat_mch_id:
-        raise BusinessError("微信支付商户号不匹配", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
-    if transaction.get("appid") != settings.wechat_mini_app_id:
-        raise BusinessError("微信支付 AppID 不匹配", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
-    order_no = str(transaction.get("out_trade_no") or "")
+    await apply_wechat_payment_result(transaction, db)
+    return {"code": "SUCCESS", "message": "成功"}
+
+
+@router.post("/commerce/wechat/refund-notify")
+async def wechat_refund_notification(request: Request, db: AsyncSession = Depends(get_db)):
+    body = await request.body()
+    verify_notification_signature(request.headers, body)
+    refund = decrypt_notification(body)
+    if refund.get("mchid") != settings.wechat_mch_id:
+        raise BusinessError("微信退款商户号不匹配", status_code=400, code="WECHAT_REFUND_ORDER_MISMATCH")
+    order_no = str(refund.get("out_trade_no") or "")
     order = await OrderService.get_order_by_no_for_update(db, order_no)
     if not order:
-        raise BusinessError("微信支付订单不存在", status_code=404, code="ORDER_NOT_FOUND")
-    amount = transaction.get("amount") or {}
-    try:
-        callback_total = int(amount.get("total", -1))
-    except (TypeError, ValueError) as exc:
-        raise BusinessError("微信支付回调金额格式错误", status_code=400, code="WECHAT_PAY_AMOUNT_MISMATCH") from exc
-    if amount.get("currency", "CNY") != "CNY" or callback_total != yuan_to_fen(order.payable_amount):
-        raise BusinessError("微信支付回调金额不匹配", status_code=400, code="WECHAT_PAY_AMOUNT_MISMATCH")
-    transaction_id = str(transaction.get("transaction_id") or "")
-    if not transaction_id:
-        raise BusinessError("微信支付交易号缺失", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
-    await OrderService.mark_order_paid(db, order, payment_method="wechat", transaction_id=transaction_id)
+        raise BusinessError("微信退款订单不存在", status_code=404, code="ORDER_NOT_FOUND")
+    refund_no = str(refund.get("out_refund_no") or "")
+    refund_status, refund_id = validate_refund_result(order, refund, order.refund_no or refund_no)
+    if refund_status == "SUCCESS":
+        await OrderService.finalize_refund(
+            db,
+            order,
+            refund_no=refund_no,
+            refund_id=refund_id,
+            wallet_refund=False,
+        )
+    else:
+        order.refund_status = refund_status.lower()
+        await db.commit()
     return {"code": "SUCCESS", "message": "成功"}
 
 

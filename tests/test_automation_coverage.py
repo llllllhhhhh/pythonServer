@@ -17,13 +17,20 @@ from app.api.admin import (
     adjust_user_wallet,
     create_announcement,
     delete_announcement,
+    refund_commerce_order,
     review_registration,
     review_school_site,
     toggle_announcement,
     update_user_status,
     update_announcement,
 )
-from app.api.commerce import merchant_create_product, review_product, wechat_pay_notification
+from app.api.commerce import (
+    merchant_create_product,
+    review_product,
+    sync_wechat_standard_order,
+    wechat_pay_notification,
+    wechat_refund_notification,
+)
 from app.api.merchant import apply_school
 from app.api.support import (
     admin_messages,
@@ -45,6 +52,8 @@ from app.core.slider_captcha import (
 from app.models import (
     CommerceOrderItem,
     PlatformAnnouncement,
+    PointLedger,
+    PointRule,
     SchoolSite,
     StudyProduct,
     SupportConversation,
@@ -149,6 +158,188 @@ class DatabaseTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class StandardOrderAutomationTests(DatabaseTestCase):
+    async def test_active_wechat_query_recovers_a_missing_payment_callback(self) -> None:
+        user = await self.create_user()
+        _, product = await self.create_school_product(stock=-1, price=Decimal("0.01"))
+        payload = OrderCreateRequest(
+            items=[OrderCreateItem(product_id=product.id)],
+            payment_method="wechat",
+            idempotency_key="wechat-sync-idem-001",
+        )
+        fake_redis = FakeOrderRedis()
+        with patch("app.services.order_service.redis", fake_redis), patch(
+            "app.services.order_service.enqueue_order_payment_timeout"
+        ):
+            order = await OrderService.create_order(self.db, user, payload)
+        transaction = {
+            "appid": "wx-test",
+            "mchid": "mch-test",
+            "out_trade_no": order.order_no,
+            "transaction_id": "WX-SYNC-TX-001",
+            "trade_state": "SUCCESS",
+            "amount": {"total": 1, "currency": "CNY"},
+        }
+        with patch("app.api.commerce.query_transaction", new=AsyncMock(return_value=transaction)), patch.multiple(
+            "app.api.commerce.settings", wechat_mini_app_id="wx-test", wechat_mch_id="mch-test"
+        ):
+            result = await sync_wechat_standard_order(order.order_no, user=user, db=self.db)
+
+        self.assertEqual("paid", result.payment_status)
+        self.assertEqual("WX-SYNC-TX-001", result.transaction_id)
+        self.assertEqual(1, await self.db.scalar(select(func.count(UserEntitlement.id))))
+
+    async def test_wechat_refund_callback_finalizes_without_wallet_credit(self) -> None:
+        user = await self.create_user(balance=Decimal("12.00"))
+        _, product = await self.create_school_product(stock=-1, price=Decimal("0.01"))
+        payload = OrderCreateRequest(
+            items=[OrderCreateItem(product_id=product.id)],
+            payment_method="wechat",
+            idempotency_key="wechat-refund-notify-idem-001",
+        )
+        fake_redis = FakeOrderRedis()
+        with patch("app.services.order_service.redis", fake_redis), patch(
+            "app.services.order_service.enqueue_order_payment_timeout"
+        ):
+            order = await OrderService.create_order(self.db, user, payload)
+            await OrderService.mark_order_paid(
+                self.db, order, payment_method="wechat", transaction_id="WX-REFUND-NOTIFY-TX"
+            )
+        order.refund_no = "RF-WECHAT-NOTIFY-001"
+        order.refund_status = "processing"
+        await self.db.commit()
+        refund = {
+            "mchid": "mch-test",
+            "out_trade_no": order.order_no,
+            "out_refund_no": order.refund_no,
+            "refund_id": "5030000000002",
+            "refund_status": "SUCCESS",
+            "amount": {"refund": 1, "total": 1, "currency": "CNY"},
+        }
+        body = b"{}"
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(
+            {"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 1)},
+            receive,
+        )
+        with patch("app.api.commerce.verify_notification_signature"), patch(
+            "app.api.commerce.decrypt_notification", return_value=refund
+        ), patch.multiple("app.api.commerce.settings", wechat_mch_id="mch-test"):
+            result = await wechat_refund_notification(request, db=self.db)
+
+        await self.db.refresh(user)
+        await self.db.refresh(order)
+        await self.db.refresh(product)
+        entitlement = await self.db.scalar(select(UserEntitlement).where(UserEntitlement.order_id == order.id))
+        self.assertEqual("SUCCESS", result["code"])
+        self.assertEqual("refunded", order.payment_status)
+        self.assertEqual("success", order.refund_status)
+        self.assertEqual(Decimal("12.00"), user.balance)
+        self.assertEqual(0, product.sales)
+        self.assertEqual("expired", entitlement.status)
+
+    async def test_standard_purchase_points_and_balance_refund_are_idempotent(self) -> None:
+        user = await self.create_user(balance=Decimal("100.00"))
+        self.db.add(PointRule(id=1, purchase_score=8, valid_days=30))
+        _, product = await self.create_school_product(stock=2, price=Decimal("25.00"))
+        payload = OrderCreateRequest(
+            items=[OrderCreateItem(product_id=product.id)],
+            payment_method="balance",
+            idempotency_key="standard-refund-idem-001",
+        )
+        fake_redis = FakeOrderRedis()
+        with patch("app.services.order_service.redis", fake_redis), patch(
+            "app.services.order_service.enqueue_order_payment_timeout"
+        ):
+            order = await OrderService.create_order(self.db, user, payload)
+            await OrderService.pay_with_balance(self.db, user, order)
+            await OrderService.pay_with_balance(self.db, user, order)
+            refunded = await OrderService.finalize_refund(
+                self.db,
+                order,
+                refund_no="RF-BALANCE-001",
+                wallet_refund=True,
+            )
+            repeated = await OrderService.finalize_refund(
+                self.db,
+                refunded,
+                refund_no="RF-BALANCE-001",
+                wallet_refund=True,
+            )
+
+        await self.db.refresh(user)
+        await self.db.refresh(product)
+        entitlement = await self.db.scalar(select(UserEntitlement).where(UserEntitlement.order_id == order.id))
+        self.assertEqual("refunded", repeated.payment_status)
+        self.assertEqual(Decimal("100.00"), user.balance)
+        self.assertEqual(0, user.points)
+        self.assertEqual(2, product.stock)
+        self.assertEqual(0, product.sales)
+        self.assertEqual("expired", entitlement.status)
+        self.assertEqual(
+            2,
+            await self.db.scalar(
+                select(func.count(PointLedger.id)).where(PointLedger.user_id == user.id)
+            ),
+        )
+        self.assertEqual(
+            1,
+            await self.db.scalar(
+                select(func.count(WalletTransaction.id)).where(
+                    WalletTransaction.biz_type == "refund",
+                    WalletTransaction.biz_no == order.order_no,
+                )
+            ),
+        )
+
+    async def test_wechat_refund_does_not_credit_wallet_before_provider_success(self) -> None:
+        user = await self.create_user(balance=Decimal("12.00"))
+        _, product = await self.create_school_product(stock=2, price=Decimal("0.01"))
+        payload = OrderCreateRequest(
+            items=[OrderCreateItem(product_id=product.id)],
+            payment_method="wechat",
+            idempotency_key="wechat-refund-idem-001",
+        )
+        fake_redis = FakeOrderRedis()
+        with patch("app.services.order_service.redis", fake_redis), patch(
+            "app.services.order_service.enqueue_order_payment_timeout"
+        ):
+            order = await OrderService.create_order(self.db, user, payload)
+            await OrderService.mark_order_paid(
+                self.db, order, payment_method="wechat", transaction_id="WX-REFUND-TX-001"
+            )
+        with patch(
+            "app.api.admin.create_wechat_refund",
+            new=AsyncMock(
+                return_value={
+                    "refund_id": "5030000000001",
+                    "out_refund_no": "RF-WECHAT-001",
+                    "status": "PROCESSING",
+                    "amount": {"refund": 1, "total": 1, "currency": "CNY"},
+                }
+            ),
+        ), patch("app.api.admin.SnowflakeGenerator.next_order_no", return_value="RF-WECHAT-001"):
+            result = await refund_commerce_order(
+                order.order_no,
+                admin_user=SimpleNamespace(id=99),
+                db=self.db,
+            )
+
+        await self.db.refresh(user)
+        await self.db.refresh(order)
+        self.assertEqual("processing", result["status"])
+        self.assertEqual("paid", order.payment_status)
+        self.assertEqual("processing", order.refund_status)
+        self.assertEqual(Decimal("12.00"), user.balance)
+        self.assertEqual(
+            0,
+            await self.db.scalar(
+                select(func.count(WalletTransaction.id)).where(WalletTransaction.biz_type == "refund")
+            ),
+        )
+
     async def test_wechat_callback_marks_order_paid_once(self) -> None:
         user = await self.create_user()
         _, product = await self.create_school_product(stock=2, price=Decimal("0.01"))

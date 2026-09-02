@@ -18,8 +18,13 @@ from app.core.config import settings
 from app.core.exceptions import BusinessError
 from app.services.wechat_pay_service import (
     build_mini_program_payment_params,
+    close_transaction,
+    create_refund,
     create_jsapi_payment,
     decrypt_notification,
+    query_transaction,
+    validate_successful_transaction,
+    validate_refund_result,
     verify_notification_signature,
     yuan_to_fen,
 )
@@ -32,6 +37,8 @@ class FakeWechatOrder:
 
 class FakeWechatClient:
     last_request: dict | None = None
+    response_status = 200
+    response_json: dict | None = {"prepay_id": "wx-prepay-test"}
 
     def __init__(self, *args, **kwargs):
         pass
@@ -42,9 +49,12 @@ class FakeWechatClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def post(self, url, content, headers):
-        self.__class__.last_request = {"url": url, "content": content, "headers": headers}
-        return httpx.Response(200, json={"prepay_id": "wx-prepay-test"}, request=httpx.Request("POST", url))
+    async def request(self, method, url, content, headers):
+        self.__class__.last_request = {"method": method, "url": url, "content": content, "headers": headers}
+        request = httpx.Request(method, url)
+        if self.__class__.response_json is None:
+            return httpx.Response(self.__class__.response_status, content=b"", request=request)
+        return httpx.Response(self.__class__.response_status, json=self.__class__.response_json, request=request)
 
 
 class WechatPayTests(unittest.IsolatedAsyncioTestCase):
@@ -86,6 +96,8 @@ class WechatPayTests(unittest.IsolatedAsyncioTestCase):
         settings.wechat_merchant_private_key_path = str(self.merchant_key_path)
         settings.wechat_pay_public_key_id = "PUB_KEY_ID_TEST"
         settings.wechat_pay_public_key_path = str(self.wechat_pay_public_key_path)
+        FakeWechatClient.response_status = 200
+        FakeWechatClient.response_json = {"prepay_id": "wx-prepay-test"}
 
     def tearDown(self) -> None:
         for key, value in self.original.items():
@@ -96,6 +108,36 @@ class WechatPayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, yuan_to_fen(Decimal("0.01")))
         with self.assertRaises(BusinessError):
             yuan_to_fen(Decimal("0.001"))
+
+    def test_successful_transaction_requires_matching_identity_and_amount(self) -> None:
+        transaction = {
+            "trade_state": "SUCCESS",
+            "appid": settings.wechat_mini_app_id,
+            "mchid": settings.wechat_mch_id,
+            "out_trade_no": FakeWechatOrder.order_no,
+            "transaction_id": "4200000000001",
+            "amount": {"total": 1, "currency": "CNY"},
+        }
+        self.assertEqual("4200000000001", validate_successful_transaction(FakeWechatOrder(), transaction))
+        transaction["amount"]["total"] = 2
+        with self.assertRaises(BusinessError):
+            validate_successful_transaction(FakeWechatOrder(), transaction)
+
+    def test_refund_result_requires_matching_number_and_amount(self) -> None:
+        refund = {
+            "out_trade_no": FakeWechatOrder.order_no,
+            "out_refund_no": "RF-TEST-001",
+            "refund_id": "5030000000001",
+            "status": "PROCESSING",
+            "amount": {"refund": 1, "total": 1, "currency": "CNY"},
+        }
+        self.assertEqual(
+            ("PROCESSING", "5030000000001"),
+            validate_refund_result(FakeWechatOrder(), refund, "RF-TEST-001"),
+        )
+        refund["amount"]["refund"] = 2
+        with self.assertRaises(BusinessError):
+            validate_refund_result(FakeWechatOrder(), refund, "RF-TEST-001")
 
     async def test_jsapi_order_and_client_signature(self) -> None:
         with patch("app.services.wechat_pay_service.httpx.AsyncClient", FakeWechatClient), patch(
@@ -112,6 +154,37 @@ class WechatPayTests(unittest.IsolatedAsyncioTestCase):
         self.merchant_key.public_key().verify(
             base64.b64decode(params["paySign"]), signed, padding.PKCS1v15(), hashes.SHA256()
         )
+
+    async def test_query_close_and_refund_requests(self) -> None:
+        with patch("app.services.wechat_pay_service.httpx.AsyncClient", FakeWechatClient), patch(
+            "app.services.wechat_pay_service.verify_notification_signature"
+        ):
+            FakeWechatClient.response_json = {
+                "out_trade_no": FakeWechatOrder.order_no,
+                "trade_state": "SUCCESS",
+            }
+            result = await query_transaction(FakeWechatOrder.order_no)
+            self.assertEqual("SUCCESS", result["trade_state"])
+            self.assertEqual("GET", FakeWechatClient.last_request["method"])
+            self.assertIn("/v3/pay/transactions/out-trade-no/", FakeWechatClient.last_request["url"])
+
+            FakeWechatClient.response_status = 204
+            FakeWechatClient.response_json = None
+            await close_transaction(FakeWechatOrder.order_no)
+            self.assertEqual("POST", FakeWechatClient.last_request["method"])
+            self.assertTrue(FakeWechatClient.last_request["url"].endswith("/close"))
+
+            FakeWechatClient.response_status = 200
+            FakeWechatClient.response_json = {
+                "refund_id": "5030000000001",
+                "out_refund_no": "RF-TEST-001",
+                "status": "PROCESSING",
+            }
+            refund = await create_refund(FakeWechatOrder(), "RF-TEST-001")
+            self.assertEqual("PROCESSING", refund["status"])
+            payload = json.loads(FakeWechatClient.last_request["content"])
+            self.assertEqual({"refund": 1, "total": 1, "currency": "CNY"}, payload["amount"])
+            self.assertTrue(payload["notify_url"].endswith("/refund-notify"))
 
     def test_notification_signature_and_decryption(self) -> None:
         transaction = {

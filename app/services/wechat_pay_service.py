@@ -7,6 +7,7 @@ import secrets
 import time
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from cryptography.exceptions import InvalidSignature, InvalidTag
@@ -131,6 +132,50 @@ def build_mini_program_payment_params(prepay_id: str) -> dict[str, str]:
     }
 
 
+async def _request_json(
+    method: str,
+    canonical_url: str,
+    payload: dict | None = None,
+    *,
+    expected_statuses: tuple[int, ...] = (200,),
+) -> dict:
+    ensure_wechat_pay_configured()
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) if payload is not None else ""
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": build_authorization(method, canonical_url, body, timestamp, nonce),
+        "User-Agent": "xuetuxing/1.1",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.request(
+                method.upper(),
+                f"{WECHAT_PAY_BASE_URL}{canonical_url}",
+                content=body.encode("utf-8") if body else None,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        raise BusinessError("微信支付服务连接失败", status_code=502, code="WECHAT_PAY_UNAVAILABLE") from exc
+    verify_notification_signature(response.headers, response.content)
+    if response.status_code not in expected_statuses:
+        try:
+            error = response.json()
+        except ValueError:
+            error = {}
+        provider_code = str(error.get("code") or "REQUEST_FAILED")
+        message = str(error.get("message") or "微信支付请求失败")
+        raise BusinessError(message, status_code=502, code=f"WECHAT_PAY_{provider_code}")
+    if not response.content:
+        return {}
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise BusinessError("微信支付返回数据异常", status_code=502, code="WECHAT_PAY_INVALID_RESPONSE") from exc
+
+
 async def create_jsapi_payment(order: CommerceOrder, description: str, openid: str) -> dict[str, str]:
     ensure_wechat_pay_configured()
     if not openid:
@@ -148,33 +193,92 @@ async def create_jsapi_payment(order: CommerceOrder, description: str, openid: s
         "amount": {"total": yuan_to_fen(order.payable_amount), "currency": "CNY"},
         "payer": {"openid": openid},
     }
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     canonical_url = "/v3/pay/transactions/jsapi"
-    timestamp = str(int(time.time()))
-    nonce = secrets.token_hex(16)
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": build_authorization("POST", canonical_url, body, timestamp, nonce),
-        "User-Agent": "xuetuxing/1.1",
-    }
+    result = await _request_json("POST", canonical_url, payload, expected_statuses=(200,))
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(f"{WECHAT_PAY_BASE_URL}{canonical_url}", content=body.encode("utf-8"), headers=headers)
-    except httpx.HTTPError as exc:
-        raise BusinessError("微信支付服务连接失败", status_code=502, code="WECHAT_PAY_UNAVAILABLE") from exc
-    verify_notification_signature(response.headers, response.content)
-    if response.status_code >= 400:
-        try:
-            message = response.json().get("message") or "微信支付下单失败"
-        except ValueError:
-            message = "微信支付下单失败"
-        raise BusinessError(message, status_code=502, code="WECHAT_PAY_CREATE_FAILED")
-    try:
-        prepay_id = response.json()["prepay_id"]
+        prepay_id = result["prepay_id"]
     except (KeyError, TypeError, ValueError) as exc:
         raise BusinessError("微信支付返回数据异常", status_code=502, code="WECHAT_PAY_INVALID_RESPONSE") from exc
     return build_mini_program_payment_params(prepay_id)
+
+
+async def query_transaction(order_no: str) -> dict:
+    canonical_url = (
+        f"/v3/pay/transactions/out-trade-no/{quote(order_no, safe='')}"
+        f"?mchid={quote(settings.wechat_mch_id, safe='')}"
+    )
+    return await _request_json("GET", canonical_url)
+
+
+async def close_transaction(order_no: str) -> None:
+    canonical_url = f"/v3/pay/transactions/out-trade-no/{quote(order_no, safe='')}/close"
+    await _request_json(
+        "POST",
+        canonical_url,
+        {"mchid": settings.wechat_mch_id},
+        expected_statuses=(204,),
+    )
+
+
+async def create_refund(order: CommerceOrder, refund_no: str, reason: str = "平台退款") -> dict:
+    notify_url = settings.resolved_wechat_refund_notify_url
+    if not notify_url:
+        raise BusinessError("微信退款回调地址未配置", status_code=503, code="WECHAT_REFUND_NOT_CONFIGURED")
+    payload = {
+        "out_trade_no": order.order_no,
+        "out_refund_no": refund_no,
+        "reason": reason.strip()[:80] or "平台退款",
+        "notify_url": notify_url,
+        "amount": {
+            "refund": yuan_to_fen(order.payable_amount),
+            "total": yuan_to_fen(order.payable_amount),
+            "currency": "CNY",
+        },
+    }
+    return await _request_json("POST", "/v3/refund/domestic/refunds", payload)
+
+
+async def query_refund(refund_no: str) -> dict:
+    canonical_url = f"/v3/refund/domestic/refunds/{quote(refund_no, safe='')}"
+    return await _request_json("GET", canonical_url)
+
+
+def validate_successful_transaction(order: CommerceOrder, transaction: dict) -> str:
+    if transaction.get("trade_state") != "SUCCESS":
+        raise BusinessError("微信订单尚未支付成功", status_code=409, code="WECHAT_PAY_NOT_SUCCESS")
+    if transaction.get("mchid") != settings.wechat_mch_id:
+        raise BusinessError("微信支付商户号不匹配", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
+    if transaction.get("appid") != settings.wechat_mini_app_id:
+        raise BusinessError("微信支付 AppID 不匹配", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
+    if str(transaction.get("out_trade_no") or "") != order.order_no:
+        raise BusinessError("微信支付订单号不匹配", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
+    amount = transaction.get("amount") or {}
+    try:
+        paid_total = int(amount.get("total", -1))
+    except (TypeError, ValueError) as exc:
+        raise BusinessError("微信支付金额格式错误", status_code=400, code="WECHAT_PAY_AMOUNT_MISMATCH") from exc
+    if amount.get("currency", "CNY") != "CNY" or paid_total != yuan_to_fen(order.payable_amount):
+        raise BusinessError("微信支付金额不匹配", status_code=400, code="WECHAT_PAY_AMOUNT_MISMATCH")
+    transaction_id = str(transaction.get("transaction_id") or "")
+    if not transaction_id:
+        raise BusinessError("微信支付交易号缺失", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
+    return transaction_id
+
+
+def validate_refund_result(order: CommerceOrder, refund: dict, refund_no: str) -> tuple[str, str]:
+    if str(refund.get("out_trade_no") or order.order_no) != order.order_no:
+        raise BusinessError("微信退款订单号不匹配", status_code=400, code="WECHAT_REFUND_ORDER_MISMATCH")
+    if str(refund.get("out_refund_no") or "") != refund_no:
+        raise BusinessError("微信退款单号不匹配", status_code=400, code="WECHAT_REFUND_ORDER_MISMATCH")
+    amount = refund.get("amount") or {}
+    try:
+        refund_total = int(amount.get("refund", -1))
+    except (TypeError, ValueError) as exc:
+        raise BusinessError("微信退款金额格式错误", status_code=400, code="WECHAT_REFUND_AMOUNT_MISMATCH") from exc
+    if refund_total != yuan_to_fen(order.payable_amount):
+        raise BusinessError("微信退款金额不匹配", status_code=400, code="WECHAT_REFUND_AMOUNT_MISMATCH")
+    status = str(refund.get("refund_status") or refund.get("status") or "PROCESSING").upper()
+    return status, str(refund.get("refund_id") or "")
 
 
 def verify_notification_signature(headers, body: bytes, now: int | None = None) -> None:

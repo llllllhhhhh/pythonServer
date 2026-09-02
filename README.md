@@ -335,6 +335,7 @@ python -m app.cli seed-development --admin-password "仅限本地的测试密码
 WECHAT_MCH_ID=商户号
 WECHAT_API_V3_KEY=32位APIv3密钥
 WECHAT_NOTIFY_URL=https://你的域名/api/v1/commerce/wechat/notify
+WECHAT_REFUND_NOTIFY_URL=https://你的域名/api/v1/commerce/wechat/refund-notify
 WECHAT_MERCHANT_SERIAL_NO=商户API证书序列号
 WECHAT_MERCHANT_PRIVATE_KEY_PATH=C:/绝对路径/apiclient_key.pem
 WECHAT_PAY_PUBLIC_KEY_ID=PUB_KEY_ID开头的微信支付公钥ID
@@ -342,6 +343,8 @@ WECHAT_PAY_PUBLIC_KEY_PATH=C:/绝对路径/wechatpay_pub.pem
 ```
 
 `apiclient_key.pem` 是商户 API 证书私钥；`wechatpay_pub.pem` 是微信支付公钥，两者不是同一个文件。本项目仅使用微信支付公钥模式，回调和统一下单响应的 `Wechatpay-Serial` 必须与 `WECHAT_PAY_PUBLIC_KEY_ID` 一致。私钥只能放在后端服务器，禁止放入小程序、管理后台或 Git。回调地址必须是公网可访问的 HTTPS 地址，服务器时间需启用 NTP 同步。
+
+支付完成后用户端会调用 `/pay/wechat/sync` 主动向微信查单，补偿支付回调延迟。超时任务会先查微信状态：已支付则补入账，未支付则先关微信订单再恢复库存。微信退款进入 `processing` 后不会立即撤销权益，只有微信退款成功通知到达 `/commerce/wechat/refund-notify` 后才完成权益、积分、销量和库存回退。若不单独配置 `WECHAT_REFUND_NOTIFY_URL`，后端会在支付回调以 `/notify` 结尾时自动推导为 `/refund-notify`。
 
 订单问题排查：
 
