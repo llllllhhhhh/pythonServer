@@ -341,7 +341,7 @@ WECHAT_PAY_PUBLIC_KEY_ID=PUB_KEY_ID开头的微信支付公钥ID
 WECHAT_PAY_PUBLIC_KEY_PATH=C:/绝对路径/wechatpay_pub.pem
 ```
 
-`apiclient_key.pem` 是商户 API 证书私钥；`wechatpay_pub.pem` 是微信支付公钥，两者不是同一个文件。使用旧平台证书模式时，可不填公钥 ID/路径，改填 `WECHAT_PLATFORM_CERTIFICATE_PATH`。私钥只能放在后端服务器，禁止放入小程序、管理后台或 Git。回调地址必须是公网可访问的 HTTPS 地址，服务器时间需启用 NTP 同步。
+`apiclient_key.pem` 是商户 API 证书私钥；`wechatpay_pub.pem` 是微信支付公钥，两者不是同一个文件。本项目仅使用微信支付公钥模式，回调和统一下单响应的 `Wechatpay-Serial` 必须与 `WECHAT_PAY_PUBLIC_KEY_ID` 一致。私钥只能放在后端服务器，禁止放入小程序、管理后台或 Git。回调地址必须是公网可访问的 HTTPS 地址，服务器时间需启用 NTP 同步。
 
 订单问题排查：
 

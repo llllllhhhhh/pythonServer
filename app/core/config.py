@@ -21,7 +21,6 @@ class Settings(BaseSettings):
     wechat_notify_url: str = ""
     wechat_merchant_serial_no: str = ""
     wechat_merchant_private_key_path: str = ""
-    wechat_platform_certificate_path: str = ""
     wechat_pay_public_key_id: str = ""
     wechat_pay_public_key_path: str = ""
     mysql_host: str = "127.0.0.1"
@@ -76,13 +75,13 @@ class Settings(BaseSettings):
                 "WECHAT_MERCHANT_SERIAL_NO": self.wechat_merchant_serial_no,
                 "WECHAT_MERCHANT_PRIVATE_KEY_PATH": self.wechat_merchant_private_key_path,
             }
-            verification_configured = bool(self.wechat_platform_certificate_path) or bool(
-                self.wechat_pay_public_key_id and self.wechat_pay_public_key_path
-            )
-            if any(payment_config.values()) or verification_configured:
+            public_key_configured = bool(self.wechat_pay_public_key_id and self.wechat_pay_public_key_path)
+            if any(payment_config.values()) or public_key_configured:
                 missing = [key for key, value in payment_config.items() if not value]
-                if not verification_configured:
-                    missing.append("WECHAT_PAY_PUBLIC_KEY_ID/PATH or WECHAT_PLATFORM_CERTIFICATE_PATH")
+                if not self.wechat_pay_public_key_id:
+                    missing.append("WECHAT_PAY_PUBLIC_KEY_ID")
+                if not self.wechat_pay_public_key_path:
+                    missing.append("WECHAT_PAY_PUBLIC_KEY_PATH")
                 if missing or not self.wechat_mini_app_id:
                     suffix = ", WECHAT_MINI_APP_ID" if not self.wechat_mini_app_id else ""
                     raise ValueError(f"Incomplete WeChat Pay configuration: {', '.join(missing)}{suffix}")

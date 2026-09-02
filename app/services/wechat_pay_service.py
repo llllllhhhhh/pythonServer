@@ -9,7 +9,6 @@ from decimal import Decimal
 from pathlib import Path
 
 import httpx
-from cryptography import x509
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -34,10 +33,7 @@ def is_wechat_pay_configured() -> bool:
             settings.wechat_merchant_private_key_path,
         )
     )
-    verifier = bool(settings.wechat_platform_certificate_path) or bool(
-        settings.wechat_pay_public_key_id and settings.wechat_pay_public_key_path
-    )
-    return common and verifier
+    return common and bool(settings.wechat_pay_public_key_id and settings.wechat_pay_public_key_path)
 
 
 def ensure_wechat_pay_configured() -> None:
@@ -85,35 +81,18 @@ def _merchant_private_key():
         ) from exc
 
 
-def _platform_certificate() -> x509.Certificate:
-    raw = _read_required_file(settings.wechat_platform_certificate_path, "微信支付平台证书")
+def _notification_public_key(serial: str):
+    if serial != settings.wechat_pay_public_key_id:
+        raise BusinessError("微信支付公钥 ID 不匹配", status_code=400, code="WECHAT_PAY_INVALID_SIGNATURE")
+    raw = _read_required_file(settings.wechat_pay_public_key_path, "微信支付公钥")
     try:
-        return x509.load_pem_x509_certificate(raw)
+        return serialization.load_pem_public_key(raw)
     except ValueError as exc:
         raise BusinessError(
-            "微信支付平台证书格式错误",
+            "微信支付公钥格式错误",
             status_code=503,
             code="WECHAT_PAY_CERTIFICATE_ERROR",
         ) from exc
-
-
-def _notification_public_key(serial: str):
-    if settings.wechat_pay_public_key_id and settings.wechat_pay_public_key_path:
-        if serial != settings.wechat_pay_public_key_id:
-            raise BusinessError("微信支付公钥 ID 不匹配", status_code=400, code="WECHAT_PAY_INVALID_SIGNATURE")
-        raw = _read_required_file(settings.wechat_pay_public_key_path, "微信支付公钥")
-        try:
-            return serialization.load_pem_public_key(raw)
-        except ValueError as exc:
-            raise BusinessError(
-                "微信支付公钥格式错误",
-                status_code=503,
-                code="WECHAT_PAY_CERTIFICATE_ERROR",
-            ) from exc
-    certificate = _platform_certificate()
-    if serial.upper() != format(certificate.serial_number, "X").upper():
-        raise BusinessError("微信支付平台证书序列号不匹配", status_code=400, code="WECHAT_PAY_INVALID_SIGNATURE")
-    return certificate.public_key()
 
 
 def _rsa_sign(message: str) -> str:

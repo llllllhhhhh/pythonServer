@@ -5,17 +5,14 @@ import json
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.x509.oid import NameOID
 
 from app.core.config import settings
 from app.core.exceptions import BusinessError
@@ -55,9 +52,9 @@ class WechatPayTests(unittest.IsolatedAsyncioTestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
         self.merchant_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        self.platform_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.wechat_pay_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.merchant_key_path = root / "merchant.pem"
-        self.platform_cert_path = root / "platform.pem"
+        self.wechat_pay_public_key_path = root / "wechatpay_pub.pem"
         self.merchant_key_path.write_bytes(
             self.merchant_key.private_bytes(
                 serialization.Encoding.PEM,
@@ -65,18 +62,12 @@ class WechatPayTests(unittest.IsolatedAsyncioTestCase):
                 serialization.NoEncryption(),
             )
         )
-        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Wechat Pay Test")])
-        self.platform_cert = (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(issuer)
-            .public_key(self.platform_key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=30))
-            .sign(self.platform_key, hashes.SHA256())
+        self.wechat_pay_public_key_path.write_bytes(
+            self.wechat_pay_key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
         )
-        self.platform_cert_path.write_bytes(self.platform_cert.public_bytes(serialization.Encoding.PEM))
         self.original = {
             "wechat_mini_app_id": settings.wechat_mini_app_id,
             "wechat_mch_id": settings.wechat_mch_id,
@@ -84,7 +75,6 @@ class WechatPayTests(unittest.IsolatedAsyncioTestCase):
             "wechat_notify_url": settings.wechat_notify_url,
             "wechat_merchant_serial_no": settings.wechat_merchant_serial_no,
             "wechat_merchant_private_key_path": settings.wechat_merchant_private_key_path,
-            "wechat_platform_certificate_path": settings.wechat_platform_certificate_path,
             "wechat_pay_public_key_id": settings.wechat_pay_public_key_id,
             "wechat_pay_public_key_path": settings.wechat_pay_public_key_path,
         }
@@ -94,9 +84,8 @@ class WechatPayTests(unittest.IsolatedAsyncioTestCase):
         settings.wechat_notify_url = "https://example.com/api/v1/commerce/wechat/notify"
         settings.wechat_merchant_serial_no = "MERCHANT-SERIAL"
         settings.wechat_merchant_private_key_path = str(self.merchant_key_path)
-        settings.wechat_platform_certificate_path = str(self.platform_cert_path)
-        settings.wechat_pay_public_key_id = ""
-        settings.wechat_pay_public_key_path = ""
+        settings.wechat_pay_public_key_id = "PUB_KEY_ID_TEST"
+        settings.wechat_pay_public_key_path = str(self.wechat_pay_public_key_path)
 
     def tearDown(self) -> None:
         for key, value in self.original.items():
@@ -150,43 +139,34 @@ class WechatPayTests(unittest.IsolatedAsyncioTestCase):
         timestamp = str(int(time.time()))
         callback_nonce = "callback-nonce"
         message = f"{timestamp}\n{callback_nonce}\n{body.decode()}\n".encode()
-        signature = self.platform_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+        signature = self.wechat_pay_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
         headers = {
             "Wechatpay-Timestamp": timestamp,
             "Wechatpay-Nonce": callback_nonce,
             "Wechatpay-Signature": base64.b64encode(signature).decode(),
-            "Wechatpay-Serial": format(self.platform_cert.serial_number, "X"),
+            "Wechatpay-Serial": settings.wechat_pay_public_key_id,
         }
         verify_notification_signature(headers, body)
         self.assertEqual(transaction, decrypt_notification(body))
         with self.assertRaises(BusinessError):
             verify_notification_signature(headers, body + b" ")
 
-    def test_public_key_mode_verifies_notification(self) -> None:
-        public_key_path = Path(self.temp_dir.name) / "wechatpay_pub.pem"
-        public_key_path.write_bytes(
-            self.platform_key.public_key().public_bytes(
-                serialization.Encoding.PEM,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-        )
-        settings.wechat_platform_certificate_path = ""
-        settings.wechat_pay_public_key_id = "PUB_KEY_ID_TEST"
-        settings.wechat_pay_public_key_path = str(public_key_path)
+    def test_notification_rejects_unknown_public_key_id(self) -> None:
         body = b'{"id":"notification-test"}'
         timestamp = str(int(time.time()))
         nonce = "public-key-nonce"
         message = f"{timestamp}\n{nonce}\n{body.decode()}\n".encode()
-        signature = self.platform_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
-        verify_notification_signature(
-            {
-                "Wechatpay-Timestamp": timestamp,
-                "Wechatpay-Nonce": nonce,
-                "Wechatpay-Signature": base64.b64encode(signature).decode(),
-                "Wechatpay-Serial": "PUB_KEY_ID_TEST",
-            },
-            body,
-        )
+        signature = self.wechat_pay_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+        with self.assertRaises(BusinessError):
+            verify_notification_signature(
+                {
+                    "Wechatpay-Timestamp": timestamp,
+                    "Wechatpay-Nonce": nonce,
+                    "Wechatpay-Signature": base64.b64encode(signature).decode(),
+                    "Wechatpay-Serial": "PUB_KEY_ID_UNKNOWN",
+                },
+                body,
+            )
 
     def test_build_payment_params_requires_configured_key(self) -> None:
         params = build_mini_program_payment_params("prepay")
