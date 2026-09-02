@@ -23,8 +23,8 @@ class StudyProductPayload(BaseModel):
     product_type: str = Field(pattern="^(community|package|material)$")
     subtitle: str = Field(default="", max_length=255)
     description: str = ""
-    price: Decimal = Field(default=0, ge=0)
-    original_price: Decimal = Field(default=0, ge=0)
+    price: Decimal = Field(default=0, ge=0, max_digits=10, decimal_places=2)
+    original_price: Decimal = Field(default=0, ge=0, max_digits=10, decimal_places=2)
     billing_cycle: str = Field(default="once", pattern="^(once|month|year)$")
     cover: str = ""
     benefits: list[str] = Field(default_factory=list)

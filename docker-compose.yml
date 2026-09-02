@@ -5,6 +5,14 @@ x-app-environment: &app-environment
   APP_SECRET_KEY: ${APP_SECRET_KEY:-development-only-change-me-32-bytes}
   WECHAT_MINI_APP_ID: ${WECHAT_MINI_APP_ID:-}
   WECHAT_MINI_APP_SECRET: ${WECHAT_MINI_APP_SECRET:-}
+  WECHAT_MCH_ID: ${WECHAT_MCH_ID:-}
+  WECHAT_API_V3_KEY: ${WECHAT_API_V3_KEY:-}
+  WECHAT_NOTIFY_URL: ${WECHAT_NOTIFY_URL:-}
+  WECHAT_MERCHANT_SERIAL_NO: ${WECHAT_MERCHANT_SERIAL_NO:-}
+  WECHAT_MERCHANT_PRIVATE_KEY_PATH: ${WECHAT_MERCHANT_PRIVATE_KEY_PATH:-}
+  WECHAT_PLATFORM_CERTIFICATE_PATH: ${WECHAT_PLATFORM_CERTIFICATE_PATH:-}
+  WECHAT_PAY_PUBLIC_KEY_ID: ${WECHAT_PAY_PUBLIC_KEY_ID:-}
+  WECHAT_PAY_PUBLIC_KEY_PATH: ${WECHAT_PAY_PUBLIC_KEY_PATH:-}
   ASSET_URL_TTL_SECONDS: ${ASSET_URL_TTL_SECONDS:-900}
   MYSQL_HOST: mysql
   MYSQL_PORT: 3306
@@ -83,6 +91,7 @@ services:
       - "8000:8000"
     volumes:
       - uploads_data:/app/uploads
+      - ./secrets:/run/secrets/xuetuxing:ro
     depends_on:
       mysql:
         condition: service_healthy

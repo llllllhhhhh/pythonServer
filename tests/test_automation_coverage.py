@@ -23,7 +23,7 @@ from app.api.admin import (
     update_user_status,
     update_announcement,
 )
-from app.api.commerce import merchant_create_product, review_product
+from app.api.commerce import merchant_create_product, review_product, wechat_pay_notification
 from app.api.merchant import apply_school
 from app.api.support import (
     admin_messages,
@@ -149,6 +149,58 @@ class DatabaseTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class StandardOrderAutomationTests(DatabaseTestCase):
+    async def test_wechat_callback_marks_order_paid_once(self) -> None:
+        user = await self.create_user()
+        _, product = await self.create_school_product(stock=2, price=Decimal("0.01"))
+        payload = OrderCreateRequest(
+            items=[OrderCreateItem(product_id=product.id, quantity=1)],
+            payment_method="wechat",
+            idempotency_key="wechat-callback-idem-001",
+        )
+        fake_redis = FakeOrderRedis()
+        with patch("app.services.order_service.redis", fake_redis), patch(
+            "app.services.order_service.enqueue_order_payment_timeout"
+        ):
+            order = await OrderService.create_order(self.db, user, payload)
+
+        body = b"{}"
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(
+            {"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 1)},
+            receive,
+        )
+        transaction = {
+            "appid": "wx-test",
+            "mchid": "mch-test",
+            "out_trade_no": order.order_no,
+            "transaction_id": "WX-TRANSACTION-001",
+            "trade_state": "SUCCESS",
+            "amount": {"total": 1, "currency": "CNY"},
+        }
+        with patch("app.api.commerce.verify_notification_signature"), patch(
+            "app.api.commerce.decrypt_notification", return_value=transaction
+        ), patch.multiple(
+            "app.api.commerce.settings", wechat_mini_app_id="wx-test", wechat_mch_id="mch-test"
+        ):
+            first = await wechat_pay_notification(request, db=self.db)
+            request = Request(
+                {"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 1)},
+                receive,
+            )
+            second = await wechat_pay_notification(request, db=self.db)
+
+        self.assertEqual("SUCCESS", first["code"])
+        self.assertEqual("SUCCESS", second["code"])
+        await self.db.refresh(order)
+        await self.db.refresh(product)
+        self.assertEqual("paid", order.payment_status)
+        self.assertEqual("WX-TRANSACTION-001", order.transaction_id)
+        self.assertEqual(1, await self.db.scalar(select(func.count(UserEntitlement.id))))
+        self.assertEqual(1, product.sales)
+
     async def test_mark_paid_is_idempotent_and_serialized(self) -> None:
         user = await self.create_user()
         _, product = await self.create_school_product(stock=2, price=Decimal("25.00"))

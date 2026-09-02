@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +28,13 @@ from app.schemas.commerce import (
 from app.schemas.order import OrderCreateRequest, OrderOut
 from app.services.order_service import OrderService
 from app.services.point_service import PointService
+from app.services.wechat_pay_service import (
+    create_jsapi_payment,
+    decrypt_notification,
+    is_wechat_pay_configured,
+    verify_notification_signature,
+    yuan_to_fen,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["study-commerce"])
@@ -208,6 +215,18 @@ async def my_standard_orders(user: UserAccount = Depends(get_current_user), db: 
     return await commerce_orders_out_batch(db, orders)
 
 
+@router.get("/commerce/standard-orders/{order_no}", response_model=OrderOut)
+async def standard_order_detail(
+    order_no: str,
+    user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> OrderOut:
+    order = await OrderService.get_order_by_no(db, order_no)
+    if not order or order.user_id != user.id:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    return await commerce_order_out(db, order)
+
+
 @router.get("/commerce/wallet")
 async def my_wallet(user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Return current user's wallet balance and recent transaction records."""
@@ -251,6 +270,57 @@ async def balance_pay_standard_order(
         raise HTTPException(status_code=404, detail="订单不存在")
     paid = await OrderService.pay_with_balance(db, user, order)
     return await commerce_order_out(db, paid)
+
+
+@router.post("/commerce/standard-orders/{order_no}/pay/wechat")
+async def wechat_pay_standard_order(
+    order_no: str,
+    user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    order = await OrderService.get_order_by_no(db, order_no)
+    if not order or order.user_id != user.id:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.payment_status == CommercePaymentStatus.PAID:
+        raise BusinessError("订单已支付", status_code=409, code="ORDER_ALREADY_PAID")
+    if order.status != "pending":
+        raise BusinessError("订单当前状态不可支付", status_code=400, code="ORDER_NOT_PAYABLE")
+    items = await OrderService.get_order_items(db, order.id)
+    description = "、".join(item.product_name for item in items) or "学徒行学习服务"
+    params = await create_jsapi_payment(order, description, user.wechat_openid or "")
+    if order.payment_method != "wechat":
+        order.payment_method = "wechat"
+        await db.commit()
+    return {"order_no": order.order_no, "amount": order.payable_amount, **params}
+
+
+@router.post("/commerce/wechat/notify")
+async def wechat_pay_notification(request: Request, db: AsyncSession = Depends(get_db)):
+    body = await request.body()
+    verify_notification_signature(request.headers, body)
+    transaction = decrypt_notification(body)
+    if transaction.get("trade_state") != "SUCCESS":
+        return {"code": "SUCCESS", "message": "成功"}
+    if transaction.get("mchid") != settings.wechat_mch_id:
+        raise BusinessError("微信支付商户号不匹配", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
+    if transaction.get("appid") != settings.wechat_mini_app_id:
+        raise BusinessError("微信支付 AppID 不匹配", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
+    order_no = str(transaction.get("out_trade_no") or "")
+    order = await OrderService.get_order_by_no_for_update(db, order_no)
+    if not order:
+        raise BusinessError("微信支付订单不存在", status_code=404, code="ORDER_NOT_FOUND")
+    amount = transaction.get("amount") or {}
+    try:
+        callback_total = int(amount.get("total", -1))
+    except (TypeError, ValueError) as exc:
+        raise BusinessError("微信支付回调金额格式错误", status_code=400, code="WECHAT_PAY_AMOUNT_MISMATCH") from exc
+    if amount.get("currency", "CNY") != "CNY" or callback_total != yuan_to_fen(order.payable_amount):
+        raise BusinessError("微信支付回调金额不匹配", status_code=400, code="WECHAT_PAY_AMOUNT_MISMATCH")
+    transaction_id = str(transaction.get("transaction_id") or "")
+    if not transaction_id:
+        raise BusinessError("微信支付交易号缺失", status_code=400, code="WECHAT_PAY_ORDER_MISMATCH")
+    await OrderService.mark_order_paid(db, order, payment_method="wechat", transaction_id=transaction_id)
+    return {"code": "SUCCESS", "message": "成功"}
 
 
 @router.post("/commerce/standard-orders/{order_no}/pay/mock", response_model=OrderOut)
@@ -338,7 +408,7 @@ async def payment_params(order_id: int, user: UserAccount = Depends(get_current_
     order = await db.get(StudyOrder, order_id)
     if not order or order.user_id != user.id:
         raise HTTPException(status_code=404, detail="订单不存在")
-    configured = bool(settings.wechat_app_id and settings.wechat_mch_id and settings.wechat_api_v3_key)
+    configured = is_wechat_pay_configured()
     return {
         "order_no": order.order_no,
         "amount": order.amount,

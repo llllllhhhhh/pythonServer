@@ -488,6 +488,11 @@ class SchoolSiteBase(BaseModel):
     sort_order: int = 0
     description: str = ""
 
+    @field_validator("merchant_account", mode="before")
+    @classmethod
+    def normalize_empty_merchant_account(cls, value):
+        return value or ""
+
 
 class SchoolSiteCreate(SchoolSiteBase):
     merchant_password: str = Field(default="", max_length=50)
@@ -794,7 +799,6 @@ class UploadedAssetOut(BaseModel):
         return sign_asset_url(asset_api_url(self.id))
 
     model_config = ConfigDict(from_attributes=True)
-
 
 
 

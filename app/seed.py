@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import select
 
@@ -455,6 +456,33 @@ async def seed_data(admin_phone: str, admin_password: str, admin_nickname: str) 
                     StudyContent(product_id=product.id, title="正式学习内容与服务", content_type="service",
                                  summary="购买后解锁完整内容", preview=False, sort_order=2),
                 ])
+
+        if not await db.scalar(select(StudyProduct.id).where(StudyProduct.name == "微信支付测试商品（1分）")):
+            test_product = StudyProduct(
+                name="微信支付测试商品（1分）",
+                product_type="material",
+                subtitle="仅用于微信支付 API v3 联调",
+                description="真实支付最低金额为 1 分。支付成功后自动发放测试权益。",
+                price=Decimal("0.01"),
+                original_price=Decimal("0.01"),
+                billing_cycle="once",
+                stock=-1,
+                status=True,
+                review_status="approved",
+                benefits=["微信支付链路验证", "支付回调验证", "权益幂等验证"],
+            )
+            db.add(test_product)
+            await db.flush()
+            db.add(
+                StudyContent(
+                    product_id=test_product.id,
+                    title="微信支付测试权益",
+                    content_type="material",
+                    summary="用于确认支付成功后的权益发放结果",
+                    preview=False,
+                    sort_order=1,
+                )
+            )
 
         for decoration in list(await db.scalars(select(DecorationConfig))):
             decoration.content = normalize_points_text(decoration.content)

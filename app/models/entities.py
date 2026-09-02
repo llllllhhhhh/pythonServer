@@ -409,7 +409,7 @@ class SchoolSite(Base, TimestampMixin):
     current: Mapped[bool] = mapped_column("is_current", Boolean, default=False, index=True)
     review_status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     reject_reason: Mapped[str] = mapped_column(String(255), default="")
-    merchant_account: Mapped[str] = mapped_column(String(60), default="", index=True)
+    merchant_account: Mapped[str | None] = mapped_column(String(60), nullable=True, default=None, index=True)
     merchant_password_hash: Mapped[str] = mapped_column(String(255), default="")
     display_weight: Mapped[int] = mapped_column(Integer, default=0, index=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)

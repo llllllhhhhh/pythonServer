@@ -295,7 +295,7 @@ python -m app.cli seed-development --admin-password "仅限本地的测试密码
 | 人工定制 | `/api/v1/custom-travel/requests` | 用户提交/查看人工定制需求 |
 | 人工定制审核 | `/api/v1/admin/custom-travel/requests` | 管理后台审核并填写方案 |
 | 学习产品 | `/api/v1/public/study/products` | 用户端学习服务列表 |
-| 学习订单 | `/api/v1/commerce/standard-orders` | 余额购买学习产品 |
+| 学习订单 | `/api/v1/commerce/standard-orders` | 余额或微信支付购买学习产品 |
 | 订单退款 | `/api/v1/admin/commerce/orders/{order_no}/refund` | 管理员退款（幂等，回补余额与库存） |
 | 邀请积分补发 | `/api/v1/admin/invites/backfill-rewards` | 规则开启后补发历史邀请积分 |
 | 偏好事件 | `/api/v1/public/preferences/events` | 用户偏好采集（登录用户强制归属，游客按 IP 限流） |
@@ -307,13 +307,15 @@ python -m app.cli seed-development --admin-password "仅限本地的测试密码
 
 ## 学习订单系统
 
-标准学习订单使用 `commerce_orders` 和 `commerce_order_items` 两张表，用户端走余额支付：
+标准学习订单使用 `commerce_orders` 和 `commerce_order_items` 两张表，用户端支持余额支付和微信小程序 JSAPI 支付：
 
 1. `POST /api/v1/commerce/standard-orders` 创建订单。
 2. `POST /api/v1/commerce/standard-orders/{order_no}/pay/balance` 扣余额并支付。
-3. 后端写入 `wallet_transactions` 支出流水。
-4. 后端写入 `user_entitlements`，学习中心据此展示已购权益。
-5. 管理端 `/api/v1/admin/commerce/orders` 和商户端 `/api/v1/merchant/commerce/orders` 同步查看订单。
+   微信支付则调用 `POST /api/v1/commerce/standard-orders/{order_no}/pay/wechat` 获取 `uni.requestPayment` 参数。
+3. 微信服务器向 `POST /api/v1/commerce/wechat/notify` 发回支付通知；后端验签、解密并核对商户号、AppID、订单号和金额后入账。
+4. 余额支付写入 `wallet_transactions` 支出流水；微信支付保存微信交易号。
+5. 后端写入 `user_entitlements`，学习中心据此展示已购权益。
+6. 管理端 `/api/v1/admin/commerce/orders` 和商户端 `/api/v1/merchant/commerce/orders` 同步查看订单。
 
 关键保护：
 
@@ -324,6 +326,22 @@ python -m app.cli seed-development --admin-password "仅限本地的测试密码
 - 自动取消未支付订单时也锁订单行，避免支付和取消同时改状态。
 - 有限库存商品会先用 Redis 预扣，再在 MySQL 中扣减；失败会回滚 Redis 库存。
 - 未支付订单默认 30 分钟超时，配置项是 `.env` / `Settings.order_payment_timeout_minutes`。
+
+### 微信支付配置
+
+微信支付金额以整数“分”为单位，真实支付最低测试金额为 `0.01 元`，不能使用 `0.001 元`。小程序 AppID 必须已绑定到微信支付商户号。
+
+```env
+WECHAT_MCH_ID=商户号
+WECHAT_API_V3_KEY=32位APIv3密钥
+WECHAT_NOTIFY_URL=https://你的域名/api/v1/commerce/wechat/notify
+WECHAT_MERCHANT_SERIAL_NO=商户API证书序列号
+WECHAT_MERCHANT_PRIVATE_KEY_PATH=C:/绝对路径/apiclient_key.pem
+WECHAT_PAY_PUBLIC_KEY_ID=PUB_KEY_ID开头的微信支付公钥ID
+WECHAT_PAY_PUBLIC_KEY_PATH=C:/绝对路径/wechatpay_pub.pem
+```
+
+`apiclient_key.pem` 是商户 API 证书私钥；`wechatpay_pub.pem` 是微信支付公钥，两者不是同一个文件。使用旧平台证书模式时，可不填公钥 ID/路径，改填 `WECHAT_PLATFORM_CERTIFICATE_PATH`。私钥只能放在后端服务器，禁止放入小程序、管理后台或 Git。回调地址必须是公网可访问的 HTTPS 地址，服务器时间需启用 NTP 同步。
 
 订单问题排查：
 

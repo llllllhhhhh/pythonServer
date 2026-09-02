@@ -452,6 +452,7 @@ async def school_sites(db: AsyncSession = Depends(get_db)):
 async def create_school_site(payload: SchoolSiteCreate, db: AsyncSession = Depends(get_db)):
     data = payload.model_dump()
     merchant_password = data.pop("merchant_password", "")
+    data["merchant_account"] = data.get("merchant_account") or None
     data["current"] = False
     data["status"] = data.get("review_status") == "approved" and data.get("status", True)
     if data.get("merchant_account"):
@@ -473,6 +474,7 @@ async def update_school_site(school_id: int, payload: SchoolSiteUpdate, db: Asyn
     if not item:
         raise HTTPException(status_code=404, detail="School site not found")
     data = payload.model_dump()
+    data["merchant_account"] = data.get("merchant_account") or None
     data["current"] = False
     if data.get("review_status") != "approved":
         data["status"] = False

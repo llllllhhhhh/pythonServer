@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     wechat_mch_id: str = ""
     wechat_api_v3_key: str = ""
     wechat_notify_url: str = ""
+    wechat_merchant_serial_no: str = ""
+    wechat_merchant_private_key_path: str = ""
+    wechat_platform_certificate_path: str = ""
+    wechat_pay_public_key_id: str = ""
+    wechat_pay_public_key_path: str = ""
     mysql_host: str = "127.0.0.1"
     mysql_port: int = 3306
     mysql_user: str = "xuetuxing"
@@ -64,8 +69,23 @@ class Settings(BaseSettings):
                 raise ValueError("CORS_ORIGINS must use HTTPS in production")
             if self.mysql_password in {"", "xuetuxing123", "root123456"}:
                 raise ValueError("MYSQL_PASSWORD must not use a development default in production")
-            if bool(self.wechat_mch_id) != bool(self.wechat_api_v3_key):
-                raise ValueError("WECHAT_MCH_ID and WECHAT_API_V3_KEY must be configured together")
+            payment_config = {
+                "WECHAT_MCH_ID": self.wechat_mch_id,
+                "WECHAT_API_V3_KEY": self.wechat_api_v3_key,
+                "WECHAT_NOTIFY_URL": self.wechat_notify_url,
+                "WECHAT_MERCHANT_SERIAL_NO": self.wechat_merchant_serial_no,
+                "WECHAT_MERCHANT_PRIVATE_KEY_PATH": self.wechat_merchant_private_key_path,
+            }
+            verification_configured = bool(self.wechat_platform_certificate_path) or bool(
+                self.wechat_pay_public_key_id and self.wechat_pay_public_key_path
+            )
+            if any(payment_config.values()) or verification_configured:
+                missing = [key for key, value in payment_config.items() if not value]
+                if not verification_configured:
+                    missing.append("WECHAT_PAY_PUBLIC_KEY_ID/PATH or WECHAT_PLATFORM_CERTIFICATE_PATH")
+                if missing or not self.wechat_mini_app_id:
+                    suffix = ", WECHAT_MINI_APP_ID" if not self.wechat_mini_app_id else ""
+                    raise ValueError(f"Incomplete WeChat Pay configuration: {', '.join(missing)}{suffix}")
             if self.storage_driver.lower() == "obs":
                 missing = [
                     key

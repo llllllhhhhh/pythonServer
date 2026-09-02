@@ -1,4 +1,4 @@
-"""stock sync, timeout job flag, school/entitlement unique constraints
+"""stock sync, timeout job flag, school unique constraints
 
 Revision ID: f6a3b4c5d602
 Revises: f5c2d8a9e731
@@ -47,57 +47,65 @@ def _dedupe_school_sites(bind) -> None:
                     GROUP BY name, city
                     HAVING COUNT(*) > 1
                 ) d ON s.name = d.name AND s.city = d.city AND s.id <> d.keep_id
-                SET s.merchant_account = CONCAT(IFNULL(s.merchant_account, ''), 'dup-', s.id)
+                SET s.name = CONCAT(LEFT(s.name, 140), ' (duplicate-', s.id, ')')
                 """
             )
         )
 
 
-def _dedupe_entitlements(bind) -> None:
-    """Drop duplicate user_entitlements rows for the same order (keep the
-    smallest id) so the order_id unique constraint can be created."""
-    if bind.dialect.name == "mysql":
-        bind.execute(
-            sa.text(
-                """
-                DELETE e FROM user_entitlements e
-                JOIN user_entitlements keep
-                  ON keep.order_id = e.order_id
-                 AND keep.id = (SELECT MIN(id) FROM user_entitlements k2 WHERE k2.order_id = e.order_id)
-                WHERE e.id <> keep.id
-                """
-            )
-        )
+def _column_exists(bind, table_name: str, column_name: str) -> bool:
+    return column_name in {item["name"] for item in sa.inspect(bind).get_columns(table_name)}
+
+
+def _index_exists(bind, table_name: str, index_name: str) -> bool:
+    return index_name in {item["name"] for item in sa.inspect(bind).get_indexes(table_name)}
+
+
+def _unique_exists(bind, table_name: str, constraint_name: str) -> bool:
+    return constraint_name in {
+        item["name"] for item in sa.inspect(bind).get_unique_constraints(table_name)
+    }
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
     # V10: flag orders whose delayed timeout job could not be scheduled,
     # so a sweep task can still auto-cancel them.
-    op.add_column(
-        "commerce_orders",
-        sa.Column("timeout_job_scheduled", sa.Boolean(), nullable=False, server_default=sa.text("1")),
-    )
-    op.create_index(
-        "ix_commerce_orders_timeout_job_scheduled",
-        "commerce_orders",
-        ["timeout_job_scheduled"],
-    )
+    if not _column_exists(bind, "commerce_orders", "timeout_job_scheduled"):
+        op.add_column(
+            "commerce_orders",
+            sa.Column("timeout_job_scheduled", sa.Boolean(), nullable=False, server_default=sa.text("1")),
+        )
+    if not _index_exists(bind, "commerce_orders", "ix_commerce_orders_timeout_job_scheduled"):
+        op.create_index(
+            "ix_commerce_orders_timeout_job_scheduled",
+            "commerce_orders",
+            ["timeout_job_scheduled"],
+        )
 
-    bind = op.get_bind()
-    _dedupe_school_sites(bind)
-    _dedupe_entitlements(bind)
-
-    # V12 / V3: batch mode works on both MySQL (forwards) and SQLite (copy).
+    # Empty means "not bound" in the API. Store it as NULL so the unique
+    # constraint permits multiple schools without merchant accounts.
     with op.batch_alter_table("school_sites") as batch:
-        batch.create_unique_constraint("uq_school_sites_merchant_account", ["merchant_account"])
-        batch.create_unique_constraint("uq_school_sites_name_city", ["name", "city"])
-    with op.batch_alter_table("user_entitlements") as batch:
-        batch.create_unique_constraint("uq_user_entitlements_order", ["order_id"])
+        batch.alter_column(
+            "merchant_account",
+            existing_type=sa.String(length=60),
+            nullable=True,
+            existing_server_default=None,
+        )
+    bind.execute(sa.text("UPDATE school_sites SET merchant_account = NULL WHERE merchant_account = ''"))
+
+    _dedupe_school_sites(bind)
+
+    # Batch mode works on both MySQL (forwards) and SQLite (copy).
+    if not _unique_exists(bind, "school_sites", "uq_school_sites_merchant_account"):
+        with op.batch_alter_table("school_sites") as batch:
+            batch.create_unique_constraint("uq_school_sites_merchant_account", ["merchant_account"])
+    if not _unique_exists(bind, "school_sites", "uq_school_sites_name_city"):
+        with op.batch_alter_table("school_sites") as batch:
+            batch.create_unique_constraint("uq_school_sites_name_city", ["name", "city"])
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("user_entitlements") as batch:
-        batch.drop_constraint("uq_user_entitlements_order", type_="unique")
     with op.batch_alter_table("school_sites") as batch:
         batch.drop_constraint("uq_school_sites_name_city", type_="unique")
         batch.drop_constraint("uq_school_sites_merchant_account", type_="unique")
