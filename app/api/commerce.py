@@ -13,9 +13,10 @@ from app.core.cache import RedisUnavailableError, redis
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
+from app.core.vip import VIP_PLANS, get_vip_plan
 from app.core.exceptions import BusinessError
 from app.core.order_status import CommercePaymentStatus, ReviewStatus
-from app.models import CommerceOrder, LearningCheckinRecord, LearningProfile, PointRule, PreferenceEvent, SchoolSite, StudyContent, StudyOrder, StudyProduct, TravelRoute, UserAccount, UserEntitlement, WalletTransaction
+from app.models import CommerceOrder, CommerceOrderItem, LearningCheckinRecord, LearningProfile, PointRule, PreferenceEvent, SchoolSite, StudyContent, StudyOrder, StudyProduct, TravelGoalHistory, TravelRoute, UserAccount, UserEntitlement, WalletTransaction
 from app.schemas.api import RouteCreate, RouteOut, RouteUpdate
 from app.schemas.commerce import (
     LearningOnboardingUpdate,
@@ -24,9 +25,12 @@ from app.schemas.commerce import (
     StudyOrderOut,
     StudyProductPayload,
     StudyProductReviewPayload,
+    VipOrderCreate,
+    TravelGoalCreate,
+    TravelGoalOut,
 )
 from app.schemas.order import OrderCreateRequest, OrderOut, RefundRequest
-from app.services.order_service import OrderService
+from app.services.order_service import OrderService, snowflake
 from app.services.point_service import PointService
 from app.services.wechat_pay_service import (
     create_jsapi_payment,
@@ -208,6 +212,52 @@ async def create_standard_order(
 ) -> OrderOut:
     """Create a standard commerce order with Redis idempotency and stock lock."""
     order = await OrderService.create_order(db, user, payload)
+    return await commerce_order_out(db, order)
+
+
+@router.get("/public/vip/plans")
+async def public_vip_plans():
+    return [{"id": plan_id, **plan, "benefits": ["解锁全部高级功能", "专属 VIP 身份标识", "会员有效期内持续享受会员权益"]} for plan_id, plan in VIP_PLANS.items()]
+
+
+@router.get("/commerce/travel-goals", response_model=list[TravelGoalOut])
+async def my_travel_goals(user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    return list(await db.scalars(select(TravelGoalHistory).where(TravelGoalHistory.user_id == user.id).order_by(TravelGoalHistory.id.desc()).limit(100)))
+
+
+@router.post("/commerce/travel-goals", response_model=TravelGoalOut)
+async def save_travel_goal(payload: TravelGoalCreate, user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    item = await db.scalar(select(TravelGoalHistory).where(TravelGoalHistory.user_id == user.id, TravelGoalHistory.request_key == payload.request_key))
+    if not item:
+        item = TravelGoalHistory(user_id=user.id, **payload.model_dump())
+        db.add(item)
+    else:
+        for key, value in payload.model_dump().items():
+            setattr(item, key, value)
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.post("/commerce/vip-orders", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+async def create_vip_order(
+    payload: VipOrderCreate,
+    user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> OrderOut:
+    plan = get_vip_plan(payload.plan_id)
+    if not plan:
+        raise BusinessError("VIP 方案不存在", status_code=404, code="VIP_PLAN_NOT_FOUND")
+    existing = await db.scalar(select(CommerceOrder).where(CommerceOrder.user_id == user.id, CommerceOrder.idempotency_key == payload.idempotency_key))
+    if existing:
+        return await commerce_order_out(db, existing)
+    order_no = snowflake.next_order_no("XV")
+    order = CommerceOrder(order_no=order_no, user_id=user.id, school_id=0, total_amount=plan["price"], payable_amount=plan["price"], payment_method=payload.payment_method, payment_status=CommercePaymentStatus.PENDING, status="pending", idempotency_key=payload.idempotency_key)
+    db.add(order)
+    await db.flush()
+    db.add(CommerceOrderItem(order_id=order.id, order_no=order_no, product_id=-payload.plan_id, product_name=plan["name"], product_type="vip", school_id=0, unit_price=plan["price"], quantity=1, total_amount=plan["price"], stock_deducted=False, status="pending"))
+    await db.commit()
+    await db.refresh(order)
     return await commerce_order_out(db, order)
 
 

@@ -18,6 +18,7 @@ from app.core.contract_settings import get_contract_template, save_contract_temp
 from app.core.database import get_db
 from app.core.exceptions import BusinessError
 from app.core.identity import resolve_user_identities, resolve_user_identity
+from app.core.vip import is_vip_active
 from app.core.order_status import CommerceOrderStatus, CommercePaymentStatus, TravelContractStatus, TravelFulfillmentStatus, TravelOrderStatus
 from app.core.security import require_admin
 from app.core.slider_captcha import get_slider_captcha_settings, save_slider_captcha_settings
@@ -26,6 +27,7 @@ from app.core.travel_match_settings import get_travel_match_settings, save_trave
 from app.core.upload_settings import get_upload_setting, save_upload_setting
 from app.models import (
     CommerceOrder,
+    CommerceOrderItem,
     ContentArticle,
     DecorationConfig,
     GraduationCertification,
@@ -81,6 +83,7 @@ from app.schemas.api import (
     SliderCaptchaSettingsOut,
     SliderCaptchaSettingsPayload,
     StatusUpdatePayload,
+    VipUpdatePayload,
     UploadedAssetOut,
     UploadSettingOut,
     UploadSettingPayload,
@@ -126,6 +129,12 @@ def build_user_row(
         points=user.points,
         balance=Decimal(user.balance or 0),
         exam_status=exam_status or user.exam_status,
+        vip_enabled=user.vip_enabled,
+        vip_active=is_vip_active(user),
+        vip_type=user.vip_type,
+        vip_started_at=user.vip_started_at,
+        vip_expires_at=user.vip_expires_at,
+        vip_remark=user.vip_remark,
         created_at=user.created_at,
         last_login_at=user.last_login_at,
         conversation_count=len(user_conversations),
@@ -1087,6 +1096,35 @@ async def users(registered_only: bool = False, db: AsyncSession = Depends(get_db
     )
 
 
+@router.get("/vip/orders")
+async def vip_orders(db: AsyncSession = Depends(get_db)):
+    items = list(await db.scalars(select(CommerceOrderItem).where(CommerceOrderItem.product_type == "vip").order_by(CommerceOrderItem.id.desc())))
+    if not items:
+        return []
+    order_ids = {item.order_id for item in items}
+    orders = {item.id: item for item in list(await db.scalars(select(CommerceOrder).where(CommerceOrder.id.in_(order_ids))))}
+    user_ids = {order.user_id for order in orders.values()}
+    users = {item.id: item for item in list(await db.scalars(select(UserAccount).where(UserAccount.id.in_(user_ids))))}
+    return [{
+        "order_no": orders[item.order_id].order_no,
+        "user_id": orders[item.order_id].user_id,
+        "user_name": users.get(orders[item.order_id].user_id).nickname if users.get(orders[item.order_id].user_id) else "-",
+        "phone": users.get(orders[item.order_id].user_id).phone if users.get(orders[item.order_id].user_id) else "-",
+        "plan_name": item.product_name,
+        "amount": orders[item.order_id].payable_amount,
+        "payment_status": orders[item.order_id].payment_status,
+        "status": orders[item.order_id].status,
+        "created_at": orders[item.order_id].created_at,
+        "paid_at": orders[item.order_id].paid_at,
+    } for item in items if item.order_id in orders]
+
+
+@router.get("/vip/users")
+async def vip_users(db: AsyncSession = Depends(get_db)):
+    rows = list(await db.scalars(select(UserAccount).where(UserAccount.role == "user", UserAccount.vip_enabled.is_(True)).order_by(UserAccount.vip_expires_at.desc(), UserAccount.id.desc())))
+    return [{"id": user.id, "user_no": user.user_no, "nickname": user.nickname, "phone": user.phone, "vip_active": is_vip_active(user), "vip_type": user.vip_type, "vip_started_at": user.vip_started_at, "vip_expires_at": user.vip_expires_at, "vip_remark": user.vip_remark} for user in rows]
+
+
 @router.get("/users/{user_id}", response_model=AdminUserDetail)
 async def user_detail(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await db.get(UserAccount, user_id)
@@ -1204,6 +1242,22 @@ async def update_user_status(user_id: int, payload: StatusUpdatePayload, db: Asy
     user.is_registered = payload.status == "active"
     if payload.status in {"disabled", "cancelled", "rejected"}:
         await db.execute(delete(UserSession).where(UserSession.user_id == user.id, UserSession.role == user.role))
+    await db.commit()
+    await db.refresh(user)
+    conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))
+    return build_user_row(user, conversations, exam_status=await resolve_user_identity(db, user.id))
+
+
+@router.patch("/users/{user_id}/vip", response_model=AdminUserRow)
+async def update_user_vip(user_id: int, payload: VipUpdatePayload, db: AsyncSession = Depends(get_db)):
+    user = await db.get(UserAccount, user_id)
+    if not user or user.role != "user":
+        raise HTTPException(status_code=404, detail="User not found")
+    user.vip_enabled = payload.enabled
+    user.vip_type = payload.vip_type.strip() if payload.enabled else ""
+    user.vip_started_at = payload.started_at if payload.enabled else None
+    user.vip_expires_at = payload.expires_at if payload.enabled else None
+    user.vip_remark = payload.remark.strip()
     await db.commit()
     await db.refresh(user)
     conversations = list(await db.scalars(select(SupportConversation).where(SupportConversation.user_id == user.user_no)))

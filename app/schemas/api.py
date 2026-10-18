@@ -29,6 +29,7 @@ def validate_travel_date(value: str) -> str:
 class DecorationPayload(BaseModel):
     brand: dict[str, Any]
     pages: list[dict[str, Any]]
+    bottomNav: list[dict[str, Any]] = Field(default_factory=list)
     routes: list[dict[str, Any]] = Field(default_factory=list)
     points: dict[str, Any] = Field(default_factory=dict)
     onboarding: dict[str, Any] = Field(default_factory=dict)
@@ -135,6 +136,7 @@ class PointRulePayload(BaseModel):
     invite_score: int = Field(default=1, ge=0, le=100000)
     checkin_score: int = Field(default=1, ge=0, le=100000)
     purchase_score: int = Field(default=5, ge=0, le=100000)
+    vip_purchase_score: int = Field(default=10, ge=0, le=100000)
     exchange_score: int = Field(default=100, ge=1, le=1000000)
     valid_days: int = Field(default=365, ge=1, le=36500)
     yearly_limit: int = Field(default=1, ge=0, le=1000)
@@ -142,6 +144,7 @@ class PointRulePayload(BaseModel):
     invite_enabled: bool = True
     checkin_enabled: bool = True
     purchase_enabled: bool = True
+    vip_purchase_enabled: bool = True
     enabled: bool = True
 
 
@@ -667,6 +670,12 @@ class UserOut(BaseModel):
     points: int = 0
     balance: Decimal = Decimal("0.00")
     exam_status: str = "学员"
+    vip_enabled: bool = False
+    vip_active: bool = False
+    vip_type: str = ""
+    vip_started_at: datetime | None = None
+    vip_expires_at: datetime | None = None
+    vip_remark: str = ""
     is_registered: bool = True
     last_login_at: datetime | None = None
     created_at: datetime
@@ -697,6 +706,12 @@ class AdminUserRow(BaseModel):
     points: int
     balance: Decimal = Decimal("0.00")
     exam_status: str
+    vip_enabled: bool = False
+    vip_active: bool = False
+    vip_type: str = ""
+    vip_started_at: datetime | None = None
+    vip_expires_at: datetime | None = None
+    vip_remark: str = ""
     created_at: datetime
     last_login_at: datetime | None = None
     conversation_count: int = 0
@@ -742,6 +757,22 @@ class RegistrationReviewPayload(BaseModel):
 
 class PasswordResetPayload(BaseModel):
     password: str = Field(min_length=6, max_length=50)
+
+
+class VipUpdatePayload(BaseModel):
+    enabled: bool = False
+    vip_type: str = Field(default="", max_length=30)
+    started_at: datetime | None = None
+    expires_at: datetime | None = None
+    remark: str = Field(default="", max_length=255)
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "VipUpdatePayload":
+        if self.expires_at and self.started_at and self.expires_at <= self.started_at:
+            raise ValueError("VIP 到期时间必须晚于开始时间")
+        if self.enabled and not self.vip_type.strip():
+            raise ValueError("启用 VIP 时请填写 VIP 类型")
+        return self
 
 
 class WalletAdjustPayload(BaseModel):

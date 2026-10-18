@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.core.cache import cache_get_json, cache_set_json
 from app.core.database import get_db
 from app.core.identity import resolve_user_identity
+from app.core.vip import is_vip_active
 from app.core.login_guard import clear_login_failures, ensure_login_allowed, record_login_failure
 from app.core.security import get_admin_user, get_current_user
 from app.core.slider_captcha import consume_slider_ticket, create_slider_challenge, verify_slider_challenge
@@ -133,7 +134,7 @@ async def build_auth_response(db: AsyncSession, user: UserAccount) -> AuthRespon
     await db.commit()
     await db.refresh(user)
     identity = await resolve_user_identity(db, user.id)
-    output = UserOut.model_validate(user).model_copy(update={"exam_status": identity})
+    output = UserOut.model_validate(user).model_copy(update={"exam_status": identity, "vip_active": is_vip_active(user)})
     return AuthResponse(token=token, user=output)
 
 
@@ -403,7 +404,7 @@ async def admin_login(payload: LoginPayload, request: Request, db: AsyncSession 
 @router.get("/me", response_model=UserOut)
 async def me(user: UserAccount = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     identity = await resolve_user_identity(db, user.id)
-    return UserOut.model_validate(user).model_copy(update={"exam_status": identity})
+    return UserOut.model_validate(user).model_copy(update={"exam_status": identity, "vip_active": is_vip_active(user)})
 
 
 @router.get("/invite/dashboard", response_model=InviteDashboardOut)

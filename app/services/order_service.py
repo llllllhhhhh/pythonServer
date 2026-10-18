@@ -14,6 +14,7 @@ from app.core.database import SessionLocal
 from app.core.exceptions import IdempotencyConflictError, InsufficientStockError, RedisRequiredError, BusinessError
 from app.core.order_status import CommerceOrderStatus, CommercePaymentStatus, ReviewStatus
 from app.core.snowflake import SnowflakeGenerator
+from app.core.vip import get_vip_plan
 from app.models import (
     CommerceOrder,
     CommerceOrderItem,
@@ -166,11 +167,28 @@ class OrderService:
         order.paid_at = datetime.now()
 
         items = await cls.get_order_items(db, order.id)
+        vip_items = [item for item in items if item.product_type == "vip"]
+        if vip_items:
+            vip_user = await db.scalar(select(UserAccount).where(UserAccount.id == order.user_id).with_for_update())
+            if vip_user:
+                now = datetime.now()
+                for item in vip_items:
+                    plan = get_vip_plan(abs(int(item.product_id)))
+                    if not plan:
+                        continue
+                    current_end = vip_user.vip_expires_at if vip_user.vip_enabled and vip_user.vip_expires_at and vip_user.vip_expires_at > now else now
+                    vip_user.vip_enabled = True
+                    vip_user.vip_type = plan["vip_type"]
+                    vip_user.vip_started_at = vip_user.vip_started_at or now
+                    vip_user.vip_expires_at = current_end + timedelta(days=plan["duration_days"])
+                    vip_user.vip_remark = "App VIP 订单自动开通"
+                    item.status = CommerceOrderStatus.PAID
+        study_items = [item for item in items if item.product_type != "vip"]
         products = {
             item.id: item
-            for item in list(await db.scalars(select(StudyProduct).where(StudyProduct.id.in_({row.product_id for row in items}))))
+            for item in list(await db.scalars(select(StudyProduct).where(StudyProduct.id.in_({row.product_id for row in study_items}))))
         }
-        for item in items:
+        for item in study_items:
             product = products.get(item.product_id)
             if not product:
                 continue
@@ -187,11 +205,12 @@ class OrderService:
                 )
             item.status = CommerceOrderStatus.PAID
 
-        if not await db.scalar(select(LearningProfile).where(LearningProfile.user_id == order.user_id)):
+        if study_items and not await db.scalar(select(LearningProfile).where(LearningProfile.user_id == order.user_id)):
             db.add(LearningProfile(user_id=order.user_id))
 
-        rule = await db.get(PointRule, 1)
-        reward = int(rule.purchase_score or 0) if rule and rule.enabled and rule.purchase_enabled else 0
+        rule = await db.get(PointRule, 1) if (study_items or vip_items) else None
+        is_vip_order = bool(vip_items) and not study_items
+        reward = int(rule.vip_purchase_score or 0) if is_vip_order and rule and rule.enabled and rule.vip_purchase_enabled else int(rule.purchase_score or 0) if study_items and rule and rule.enabled and rule.purchase_enabled else 0
         if reward > 0:
             point_user = await PointService.lock_user(db, order.user_id)
             valid_days = max(1, int(rule.valid_days or 365))
@@ -199,11 +218,11 @@ class OrderService:
                 db,
                 point_user,
                 reward,
-                biz_type="study_purchase",
+                biz_type="vip_purchase" if is_vip_order else "study_purchase",
                 biz_id=order.id,
                 biz_no=order.order_no,
-                idempotency_key=f"standard-purchase:{order.id}",
-                remark="购买学习产品奖励",
+                idempotency_key=f"vip-purchase:{order.id}" if is_vip_order else f"standard-purchase:{order.id}",
+                remark="购买 VIP 会员奖励" if is_vip_order else "购买学习产品奖励",
                 expires_at=datetime.now() + timedelta(days=valid_days),
             )
 
@@ -371,15 +390,17 @@ class OrderService:
                     )
                 )
 
+        items = await cls.get_order_items(db, locked_order.id)
+        is_vip_order = bool(items) and all(item.product_type == "vip" for item in items)
         await PointService.revoke_credit_locked(
             db,
             user,
-            credit_idempotency_key=f"standard-purchase:{locked_order.id}",
-            reversal_idempotency_key=f"standard-purchase-refund:{locked_order.id}",
-            biz_type="study_purchase_refund",
+            credit_idempotency_key=f"vip-purchase:{locked_order.id}" if is_vip_order else f"standard-purchase:{locked_order.id}",
+            reversal_idempotency_key=f"vip-purchase-refund:{locked_order.id}" if is_vip_order else f"standard-purchase-refund:{locked_order.id}",
+            biz_type="vip_purchase_refund" if is_vip_order else "study_purchase_refund",
             biz_id=locked_order.id,
             biz_no=locked_order.order_no,
-            remark="订单退款撤销购买奖励积分",
+            remark="VIP 订单退款撤销奖励积分" if is_vip_order else "订单退款撤销购买奖励积分",
         )
 
         entitlements = list(
@@ -392,7 +413,6 @@ class OrderService:
         for entitlement in entitlements:
             entitlement.status = "expired"
 
-        items = await cls.get_order_items(db, locked_order.id)
         product_ids = {item.product_id for item in items}
         products = {
             product.id: product

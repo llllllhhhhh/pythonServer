@@ -28,6 +28,11 @@ class UserAccount(Base, TimestampMixin):
     points: Mapped[int] = mapped_column(Integer, default=0)
     balance: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     exam_status: Mapped[str] = mapped_column(String(20), default="学员")
+    vip_enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    vip_type: Mapped[str] = mapped_column(String(30), default="")
+    vip_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    vip_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    vip_remark: Mapped[str] = mapped_column(String(255), default="")
     is_registered: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -121,6 +126,7 @@ class PointRule(Base, TimestampMixin):
     invite_score: Mapped[int] = mapped_column(Integer, default=1)
     checkin_score: Mapped[int] = mapped_column(Integer, default=1)
     purchase_score: Mapped[int] = mapped_column(Integer, default=5)
+    vip_purchase_score: Mapped[int] = mapped_column(Integer, default=10)
     exchange_score: Mapped[int] = mapped_column(Integer, default=100)
     valid_days: Mapped[int] = mapped_column(Integer, default=365)
     yearly_limit: Mapped[int] = mapped_column(Integer, default=1)
@@ -128,6 +134,7 @@ class PointRule(Base, TimestampMixin):
     invite_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     checkin_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     purchase_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    vip_purchase_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -629,6 +636,20 @@ class LearningCheckinRecord(Base, TimestampMixin):
     checkin_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
     checkin_days: Mapped[int] = mapped_column(Integer, default=1)
     note: Mapped[str] = mapped_column(String(160), default="")
+
+
+class TravelGoalHistory(Base, TimestampMixin):
+    __tablename__ = "travel_goal_histories"
+    __table_args__ = (UniqueConstraint("user_id", "request_key", name="uq_travel_goal_user_request"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    request_key: Mapped[str] = mapped_column(String(80), index=True)
+    title: Mapped[str] = mapped_column(String(160), default="旅行目标")
+    location: Mapped[str] = mapped_column(String(120), default="")
+    place_count: Mapped[int] = mapped_column(Integer, default=0)
+    criteria: Mapped[dict] = mapped_column(JSON, default=dict)
+    result_snapshot: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class GraduationCertification(Base, TimestampMixin):

@@ -80,6 +80,29 @@ class LearningProfileUpdate(BaseModel):
     current_stage: str = Field(default="基础阶段", max_length=80)
 
 
+class VipOrderCreate(BaseModel):
+    plan_id: int = Field(ge=1, le=3)
+    payment_method: str = Field(default="wechat", pattern="^(wechat|balance)$")
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class TravelGoalCreate(BaseModel):
+    request_key: str = Field(min_length=1, max_length=80)
+    title: str = Field(default="旅行目标", min_length=1, max_length=160)
+    location: str = Field(default="", max_length=120)
+    place_count: int = Field(default=0, ge=0, le=100)
+    criteria: dict = Field(default_factory=dict)
+    result_snapshot: list[dict] = Field(default_factory=list, max_length=20)
+
+
+class TravelGoalOut(TravelGoalCreate):
+    id: int
+    user_id: int
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
 class LearningOnboardingUpdate(BaseModel):
     version: int = Field(ge=1, le=100000)
     answers: dict[str, str | list[str]] = Field(default_factory=dict)
