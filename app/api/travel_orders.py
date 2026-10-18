@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -173,6 +173,14 @@ async def attach_contract_signature_assets(db: AsyncSession, orders: list[Travel
 
 
 async def attach_travel_order_details(db: AsyncSession, orders: list[TravelOrder]) -> list[TravelOrder]:
+    editable_orders = [item for item in orders if item.contract_status in {TravelContractStatus.UNSIGNED, TravelContractStatus.REJECTED}]
+    route_ids = {item.route_id for item in editable_orders if item.route_id}
+    routes = {route.id: route for route in list(await db.scalars(select(TravelRoute).where(TravelRoute.id.in_(route_ids))))} if route_ids else {}
+    for item in editable_orders:
+        route = routes.get(item.route_id)
+        if route:
+            item.title = route.name
+            item.agency = route.agency
     await attach_route_images(db, orders)
     await attach_contract_snapshots(db, orders)
     await attach_contract_signature_assets(db, orders)
@@ -581,6 +589,14 @@ async def sign_travel_contract(
     }:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Contract can no longer be signed")
     template = await get_contract_template(db)
+    selected_date = date.fromisoformat(payload.travel_date.strip().replace("/", "-"))
+    max_date = date.today() + timedelta(days=int(template.get("travel_date_days") or 30))
+    if selected_date < date.today() or selected_date > max_date:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"出行日期必须在 {date.today().isoformat()} 至 {max_date.isoformat()} 之间")
+    route = await db.get(TravelRoute, item.route_id) if item.route_id else None
+    if route:
+        item.title = route.name
+        item.agency = route.agency
     item.user_id = current_user.id
     item.user_no = current_user.user_no
     item.user_name = current_user.nickname or payload.signer_name.strip()
@@ -610,6 +626,8 @@ async def sign_travel_contract(
             "contract_template_version": item.contract_template_version,
             "contract_template_snapshot_id": item.contract_template_snapshot_id,
             "signature_url": item.contract_signature_url,
+            "route_title": item.title,
+            "agency": item.agency,
         },
     )
     await db.commit()

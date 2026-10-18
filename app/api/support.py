@@ -105,8 +105,8 @@ class SupportConnectionManager:
     def __init__(self):
         self.connections: dict[str, dict[str, set[WebSocket]]] = defaultdict(lambda: {"user": set(), "admin": set(), "merchant": set()})
 
-    async def connect(self, conversation_id: str, role: str, websocket: WebSocket):
-        await websocket.accept()
+    async def connect(self, conversation_id: str, role: str, websocket: WebSocket, subprotocol: str | None = None):
+        await websocket.accept(subprotocol=subprotocol)
         self.connections[conversation_id][role].add(websocket)
 
     def disconnect(self, conversation_id: str, role: str, websocket: WebSocket):
@@ -483,10 +483,12 @@ async def support_websocket(
     # once all clients migrate, because tokens in URLs leak into logs/history.
     resolved_token = token
     protocols = websocket.headers.get("sec-websocket-protocol", "")
+    selected_subprotocol = None
     for protocol in protocols.split(","):
         protocol = protocol.strip()
         if protocol.startswith("bearer."):
             resolved_token = protocol.removeprefix("bearer.").strip()
+            selected_subprotocol = protocol
             break
     async with SessionLocal() as db:
         conversation = await db.get(SupportConversation, conversation_id)
@@ -496,7 +498,7 @@ async def support_websocket(
         if not await authorize_support_websocket(db, conversation, role, resolved_token):
             await websocket.close(code=1008)
             return
-    await manager.connect(conversation_id, role, websocket)
+    await manager.connect(conversation_id, role, websocket, selected_subprotocol)
     await sync_presence(conversation_id)
     await manager.broadcast(conversation_id, {"type": "presence", "role": role, "online": True})
     try:

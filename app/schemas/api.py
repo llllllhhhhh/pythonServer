@@ -288,7 +288,9 @@ class RouteExchangePayload(BaseModel):
 class ContractTemplatePayload(BaseModel):
     title: str = Field(default="旅行服务合同", min_length=1, max_length=120)
     content: str = Field(min_length=1)
-    travel_date_days: int = Field(default=30, ge=0, le=365)
+    travel_date_days: int = Field(default=30, ge=1, le=36500)
+    travel_date_value: int | None = Field(default=None, ge=1, le=36500)
+    travel_date_unit: str | None = Field(default=None, pattern="^(day|year)$")
 
 
 class ContractTemplateOut(ContractTemplatePayload):
@@ -297,6 +299,8 @@ class ContractTemplateOut(ContractTemplatePayload):
     contract_template_version: int = 0
     contract_template_snapshot_id: int = 0
     travel_date_options: list[str] = Field(default_factory=list)
+    travel_date_start: str = ""
+    travel_date_end: str = ""
 
 
 class ContractSignPayload(BaseModel):

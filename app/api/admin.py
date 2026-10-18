@@ -5,13 +5,14 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.public import PUBLIC_CONFIG_KEY
 from app.api.travel_orders import attach_travel_order_details, normalize_fulfillment_status
 from app.core.auth import hash_password
+from app.core.asset_access import asset_api_url
 from app.core.cache import RedisUnavailableError, cache_delete, redis
 from app.core.config import settings
 from app.core.contract_settings import get_contract_template, save_contract_template
@@ -25,6 +26,7 @@ from app.core.slider_captcha import get_slider_captcha_settings, save_slider_cap
 from app.core.snowflake import SnowflakeGenerator
 from app.core.travel_match_settings import get_travel_match_settings, save_travel_match_settings
 from app.core.upload_settings import get_upload_setting, save_upload_setting
+from app.core.storage import save_upload_bytes, sniff_image_type
 from app.models import (
     CommerceOrder,
     CommerceOrderItem,
@@ -385,6 +387,38 @@ async def articles(db: AsyncSession = Depends(get_db)):
             )
         )
     )
+
+
+@router.post("/articles/upload-image")
+async def upload_article_image(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+    suffix = Path(file.filename or "").suffix.lower() or ".jpg"
+    if suffix not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+        raise HTTPException(status_code=400, detail="仅支持 jpg、png、gif、webp 图片")
+    upload_setting = await get_upload_setting(db)
+    max_image_size = upload_setting["max_image_bytes"]
+    content = await file.read(max_image_size + 1)
+    if len(content) > max_image_size:
+        raise HTTPException(status_code=400, detail=f"图片不能超过 {upload_setting['max_image_mb']}MB")
+    if not sniff_image_type(content, suffix):
+        raise HTTPException(status_code=400, detail="图片内容与文件类型不匹配")
+    stored = await save_upload_bytes(content, file.filename, file.content_type, "articles")
+    asset = UploadedAsset(
+        source="article",
+        storage=stored.storage,
+        bucket=stored.bucket,
+        object_key=stored.object_key,
+        path=stored.path,
+        url=stored.url,
+        filename=Path(stored.object_key).name,
+        original_name=file.filename or "",
+        mime_type=file.content_type or "",
+        size=len(content),
+        uploader_role="admin",
+    )
+    db.add(asset)
+    await db.commit()
+    await db.refresh(asset)
+    return {"id": asset.id, "url": asset_api_url(asset.id), "filename": asset.original_name}
 
 
 async def ensure_article_slug_available(db: AsyncSession, slug: str, article_id: int | None = None):

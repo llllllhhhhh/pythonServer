@@ -11,6 +11,7 @@ from app.models import ContractTemplateSnapshot, SystemSetting
 
 CONTRACT_SETTING_KEY = "travel.contract_template"
 DEFAULT_TRAVEL_DATE_DAYS = 30
+MAX_TRAVEL_DATE_DAYS = 36500
 DEFAULT_CONTRACT_TITLE = "旅行服务合同"
 
 DEFAULT_CONTRACT_CONTENT = """甲方（出行人）：{signer_name}
@@ -31,25 +32,45 @@ DEFAULT_CONTRACT_CONTENT = """甲方（出行人）：{signer_name}
 
 
 def build_travel_date_options(days: int = DEFAULT_TRAVEL_DATE_DAYS) -> list[str]:
-    days = max(0, min(365, int(days or DEFAULT_TRAVEL_DATE_DAYS)))
+    days = max(0, min(MAX_TRAVEL_DATE_DAYS, int(days or DEFAULT_TRAVEL_DATE_DAYS)))
     today = date.today()
-    return [(today + timedelta(days=offset)).isoformat() for offset in range(days + 1)]
+    return [(today + timedelta(days=offset)).isoformat() for offset in range(min(days, 31) + 1)]
 
 
 def normalize_contract_template(value: dict | None = None) -> dict:
     value = value if isinstance(value, dict) else {}
     title = str(value.get("title") or DEFAULT_CONTRACT_TITLE).strip()[:120] or DEFAULT_CONTRACT_TITLE
     content = str(value.get("content") or DEFAULT_CONTRACT_CONTENT).strip() or DEFAULT_CONTRACT_CONTENT
+    unit = str(value.get("travel_date_unit") or "").strip().lower()
     try:
-        days = int(value.get("travel_date_days", DEFAULT_TRAVEL_DATE_DAYS))
+        raw_value = int(value.get("travel_date_value"))
     except (TypeError, ValueError):
+        raw_value = 0
+    if unit in {"day", "year"} and raw_value > 0:
+        limit_value = max(1, min(100 if unit == "year" else MAX_TRAVEL_DATE_DAYS, raw_value))
+        days = limit_value * 365 if unit == "year" else limit_value
+    else:
+        try:
+            days = int(value.get("travel_date_days", DEFAULT_TRAVEL_DATE_DAYS))
+        except (TypeError, ValueError):
+            days = DEFAULT_TRAVEL_DATE_DAYS
         raw_options = value.get("travel_date_options")
-        days = max(len(raw_options) - 1, DEFAULT_TRAVEL_DATE_DAYS) if isinstance(raw_options, list) else DEFAULT_TRAVEL_DATE_DAYS
-    days = max(0, min(365, days))
+        if not days and isinstance(raw_options, list):
+            days = max(len(raw_options) - 1, DEFAULT_TRAVEL_DATE_DAYS)
+        days = max(1, min(MAX_TRAVEL_DATE_DAYS, days))
+        if days >= 365 and days % 365 == 0:
+            unit, limit_value = "year", days // 365
+        else:
+            unit, limit_value = "day", days
+    today = date.today()
     return {
         "title": title,
         "content": content,
         "travel_date_days": days,
+        "travel_date_value": limit_value,
+        "travel_date_unit": unit,
+        "travel_date_start": today.isoformat(),
+        "travel_date_end": (today + timedelta(days=days)).isoformat(),
         "travel_date_options": build_travel_date_options(days),
     }
 
@@ -59,6 +80,8 @@ def _template_hash(template: dict) -> str:
         str(template.get("title") or ""),
         str(template.get("content") or ""),
         str(template.get("travel_date_days") or 0),
+        str(template.get("travel_date_unit") or "day"),
+        str(template.get("travel_date_value") or 0),
     ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
