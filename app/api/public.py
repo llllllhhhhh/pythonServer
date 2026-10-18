@@ -15,6 +15,7 @@ from app.core.security import get_optional_user
 from app.core.storage import load_upload_bytes
 from app.core.travel_match_settings import get_travel_match_settings
 from app.core.upload_settings import get_upload_setting
+from app.core.vip import is_vip_active
 from app.models import ContentArticle, DecorationConfig, PlatformAnnouncement, PointRule, PreferenceEvent, SchoolMerchantSession, SchoolSite, SupportConversation, TravelRoute, UploadedAsset, UserAccount, UserSession
 from app.schemas.api import AnnouncementOut, ArticleOut, PointRuleOut, PreferenceEventPayload, RouteOut, SchoolSiteOut
 
@@ -225,7 +226,11 @@ async def public_announcement_detail(announcement_id: int, db: AsyncSession = De
 
 
 @router.get("/articles", response_model=list[ArticleOut])
-async def public_articles(category: str | None = None, db: AsyncSession = Depends(get_db)):
+async def public_articles(
+    category: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserAccount | None = Depends(get_optional_user),
+):
     query = select(ContentArticle).where(ContentArticle.status.is_(True))
     if category:
         query = query.where(ContentArticle.category == category)
@@ -237,11 +242,21 @@ async def public_articles(category: str | None = None, db: AsyncSession = Depend
             ContentArticle.id.desc(),
         )
     )
-    return list(result)
+    can_read_vip = bool(current_user and is_vip_active(current_user))
+    return [
+        ArticleOut.model_validate(item).model_copy(update={"content": "", "vip_locked": True})
+        if item.vip_only and not can_read_vip
+        else ArticleOut.model_validate(item)
+        for item in result
+    ]
 
 
 @router.get("/articles/{slug_or_id}", response_model=ArticleOut)
-async def public_article_detail(slug_or_id: str, db: AsyncSession = Depends(get_db)):
+async def public_article_detail(
+    slug_or_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserAccount | None = Depends(get_optional_user),
+):
     condition = ContentArticle.slug == slug_or_id
     if slug_or_id.isdigit():
         condition = or_(ContentArticle.id == int(slug_or_id), ContentArticle.slug == slug_or_id)
@@ -253,7 +268,10 @@ async def public_article_detail(slug_or_id: str, db: AsyncSession = Depends(get_
     )
     if not item:
         raise HTTPException(status_code=404, detail="Article not found")
-    return item
+    article = ArticleOut.model_validate(item)
+    if item.vip_only and not (current_user and is_vip_active(current_user)):
+        return article.model_copy(update={"content": "", "vip_locked": True})
+    return article
 
 
 @router.get("/schools", response_model=list[SchoolSiteOut])
@@ -400,8 +418,8 @@ async def public_asset_object_thumb(
     db: AsyncSession = Depends(get_db),
 ):
     suffix = object_key.rsplit(".", 1)[-1].lower() if "." in object_key else ""
-    if suffix not in {"jpg", "jpeg", "png", "gif", "webp"}:
-        raise HTTPException(status_code=400, detail="仅支持图片预览")
+    if suffix not in {"jpg", "jpeg", "png", "gif", "webp", "mp4", "webm", "mov", "m4v"}:
+        raise HTTPException(status_code=400, detail="不支持的资源格式")
     asset = await _get_asset_by_object_key(db, object_key)
     public = await _authorize_asset(asset, request, db, "object-thumb", asset_token)
     cache_dir = Path(settings.upload_dir) / ".thumb-cache" / "objects"
@@ -427,8 +445,8 @@ async def public_asset_object(
     db: AsyncSession = Depends(get_db),
 ):
     suffix = object_key.rsplit(".", 1)[-1].lower() if "." in object_key else ""
-    if suffix not in {"jpg", "jpeg", "png", "gif", "webp"}:
-        raise HTTPException(status_code=400, detail="仅支持图片预览")
+    if suffix not in {"jpg", "jpeg", "png", "gif", "webp", "mp4", "webm", "mov", "m4v"}:
+        raise HTTPException(status_code=400, detail="不支持的资源格式")
     asset = await _get_asset_by_object_key(db, object_key)
     public = await _authorize_asset(asset, request, db, "object", asset_token)
     loaded = await load_upload_bytes_with_fallback(asset.object_key, asset.storage)

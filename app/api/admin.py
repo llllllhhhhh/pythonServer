@@ -3,9 +3,10 @@ from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1472,7 +1473,58 @@ async def image_assets(
         query = query.where(UploadedAsset.source == source)
     if storage:
         query = query.where(UploadedAsset.storage == storage)
-    return list(await db.scalars(query))
+    rows = list(await db.scalars(query))
+    endpoint = (settings.obs_endpoint or f"obs.{settings.obs_region}.myhuaweicloud.com").replace("https://", "").replace("http://", "").rstrip("/")
+    result = []
+    for item in rows:
+        if item.storage == "obs" and item.bucket and item.object_key:
+            storage_url = f"https://{item.bucket}.{endpoint}/{quote(item.object_key, safe='/~')}"
+        else:
+            storage_url = item.path or item.url or ""
+        result.append({**item.__dict__, "storage_url": storage_url})
+    return result
+
+
+@router.post("/assets/upload")
+async def upload_common_asset(
+    file: UploadFile = File(...),
+    kind: str = Form(default="auto"),
+    db: AsyncSession = Depends(get_db),
+):
+    suffix = Path(file.filename or "").suffix.lower()
+    image_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    video_suffixes = {".mp4", ".webm", ".mov", ".m4v"}
+    resolved_kind = "video" if kind == "video" or suffix in video_suffixes else "image"
+    if resolved_kind == "image" and suffix not in image_suffixes:
+        raise HTTPException(status_code=400, detail="图片仅支持 jpg、png、gif、webp")
+    if resolved_kind == "video" and suffix not in video_suffixes:
+        raise HTTPException(status_code=400, detail="视频仅支持 mp4、webm、mov、m4v")
+    upload_setting = await get_upload_setting(db)
+    max_bytes = upload_setting["max_image_bytes"] if resolved_kind == "image" else 200 * 1024 * 1024
+    content = await file.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        limit = upload_setting["max_image_mb"] if resolved_kind == "image" else 200
+        raise HTTPException(status_code=400, detail=f"文件不能超过 {limit}MB")
+    if resolved_kind == "image" and not sniff_image_type(content, suffix):
+        raise HTTPException(status_code=400, detail="图片内容与文件类型不匹配")
+    stored = await save_upload_bytes(content, file.filename, file.content_type, "common")
+    asset = UploadedAsset(
+        source="common",
+        storage=stored.storage,
+        bucket=stored.bucket,
+        object_key=stored.object_key,
+        path=stored.path,
+        url=stored.url,
+        filename=Path(stored.object_key).name,
+        original_name=file.filename or "",
+        mime_type=file.content_type or ("video/mp4" if resolved_kind == "video" else "image/jpeg"),
+        size=len(content),
+        uploader_role="admin",
+    )
+    db.add(asset)
+    await db.commit()
+    await db.refresh(asset)
+    return {"id": asset.id, "kind": resolved_kind, "url": asset_api_url(asset.id), "filename": asset.original_name, "mime_type": asset.mime_type, "size": asset.size}
 
 
 @router.post("/commerce/orders/{order_no}/refund")

@@ -460,6 +460,7 @@ class ArticleBase(BaseModel):
     category: str = Field(default="鍗忚瑙勫垯", max_length=40)
     cover: str = ""
     pinned: bool = False
+    vip_only: bool = False
     status: bool = False
     sort_order: int = 0
     published_at: datetime | None = None
@@ -477,6 +478,7 @@ class ArticleOut(ArticleBase):
     id: int
     created_at: datetime
     updated_at: datetime
+    vip_locked: bool = False
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -828,6 +830,7 @@ class UploadedAssetOut(BaseModel):
     conversation_id: str = ""
     created_at: datetime
     updated_at: datetime
+    storage_url: str = ""
 
     @field_serializer("path", "url")
     def _serialize_asset_url(self, _value: str) -> str:

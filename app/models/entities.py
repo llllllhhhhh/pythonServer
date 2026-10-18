@@ -394,6 +394,7 @@ class ContentArticle(Base, TimestampMixin):
     category: Mapped[str] = mapped_column(String(40), default="协议规则", index=True)
     cover: Mapped[str] = mapped_column(Text, default="")
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    vip_only: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     status: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
