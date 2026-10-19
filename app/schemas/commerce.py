@@ -81,7 +81,7 @@ class LearningProfileUpdate(BaseModel):
 
 
 class VipOrderCreate(BaseModel):
-    plan_id: int = Field(ge=1, le=3)
+    plan_id: int = Field(ge=1, le=1000000)
     payment_method: str = Field(default="wechat", pattern="^(wechat|balance)$")
     idempotency_key: str = Field(min_length=8, max_length=120)
 

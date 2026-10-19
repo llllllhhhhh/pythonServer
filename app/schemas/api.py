@@ -781,6 +781,38 @@ class VipUpdatePayload(BaseModel):
         return self
 
 
+class VipPlanPayload(BaseModel):
+    id: int = Field(ge=1, le=1000000)
+    name: str = Field(min_length=1, max_length=40)
+    vip_type: str = Field(min_length=1, max_length=30)
+    price: float = Field(ge=0.01, le=99999.99)
+    duration_days: int = Field(ge=1, le=3650)
+    note: str = Field(default="", max_length=100)
+    badge: str = Field(default="", max_length=16)
+    benefits: list[str] = Field(default_factory=list, max_length=12)
+    enabled: bool = True
+    sort_order: int = Field(default=10, ge=0, le=9999)
+
+    @field_validator("benefits")
+    @classmethod
+    def validate_benefits(cls, value: list[str]) -> list[str]:
+        benefits = [str(item).strip()[:100] for item in value if str(item).strip()]
+        if not benefits:
+            raise ValueError("请至少填写一项 VIP 权益")
+        return benefits
+
+
+class VipPlanSettingsPayload(BaseModel):
+    plans: list[VipPlanPayload] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_unique_ids(self) -> "VipPlanSettingsPayload":
+        ids = [plan.id for plan in self.plans]
+        if len(ids) != len(set(ids)):
+            raise ValueError("VIP 套餐 ID 不能重复")
+        return self
+
+
 class WalletAdjustPayload(BaseModel):
     amount: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
     direction: str = Field(default="income", pattern="^(income|expense)$")

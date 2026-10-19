@@ -13,7 +13,7 @@ from app.core.cache import RedisUnavailableError, redis
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
-from app.core.vip import VIP_PLANS, get_vip_plan
+from app.core.vip import get_vip_plan, get_vip_plans
 from app.core.exceptions import BusinessError
 from app.core.order_status import CommercePaymentStatus, ReviewStatus
 from app.models import CommerceOrder, CommerceOrderItem, LearningCheckinRecord, LearningProfile, PointRule, PreferenceEvent, SchoolSite, StudyContent, StudyOrder, StudyProduct, TravelGoalHistory, TravelRoute, UserAccount, UserEntitlement, WalletTransaction
@@ -216,8 +216,8 @@ async def create_standard_order(
 
 
 @router.get("/public/vip/plans")
-async def public_vip_plans():
-    return [{"id": plan_id, **plan, "benefits": ["解锁全部高级功能", "专属 VIP 身份标识", "会员有效期内持续享受会员权益"]} for plan_id, plan in VIP_PLANS.items()]
+async def public_vip_plans(db: AsyncSession = Depends(get_db)):
+    return await get_vip_plans(db)
 
 
 @router.get("/commerce/travel-goals", response_model=list[TravelGoalOut])
@@ -245,7 +245,7 @@ async def create_vip_order(
     user: UserAccount = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> OrderOut:
-    plan = get_vip_plan(payload.plan_id)
+    plan = await get_vip_plan(db, payload.plan_id)
     if not plan:
         raise BusinessError("VIP 方案不存在", status_code=404, code="VIP_PLAN_NOT_FOUND")
     existing = await db.scalar(select(CommerceOrder).where(CommerceOrder.user_id == user.id, CommerceOrder.idempotency_key == payload.idempotency_key))

@@ -20,7 +20,7 @@ from app.core.contract_settings import get_contract_template, save_contract_temp
 from app.core.database import get_db
 from app.core.exceptions import BusinessError
 from app.core.identity import resolve_user_identities, resolve_user_identity
-from app.core.vip import is_vip_active
+from app.core.vip import get_vip_plans, is_vip_active, save_vip_plans
 from app.core.order_status import CommerceOrderStatus, CommercePaymentStatus, TravelContractStatus, TravelFulfillmentStatus, TravelOrderStatus
 from app.core.security import require_admin
 from app.core.slider_captcha import get_slider_captcha_settings, save_slider_captcha_settings
@@ -86,6 +86,8 @@ from app.schemas.api import (
     SliderCaptchaSettingsOut,
     SliderCaptchaSettingsPayload,
     StatusUpdatePayload,
+    VipPlanPayload,
+    VipPlanSettingsPayload,
     VipUpdatePayload,
     UploadedAssetOut,
     UploadSettingOut,
@@ -1158,6 +1160,16 @@ async def vip_orders(db: AsyncSession = Depends(get_db)):
 async def vip_users(db: AsyncSession = Depends(get_db)):
     rows = list(await db.scalars(select(UserAccount).where(UserAccount.role == "user", UserAccount.vip_enabled.is_(True)).order_by(UserAccount.vip_expires_at.desc(), UserAccount.id.desc())))
     return [{"id": user.id, "user_no": user.user_no, "nickname": user.nickname, "phone": user.phone, "vip_active": is_vip_active(user), "vip_type": user.vip_type, "vip_started_at": user.vip_started_at, "vip_expires_at": user.vip_expires_at, "vip_remark": user.vip_remark} for user in rows]
+
+
+@router.get("/vip/plans", response_model=list[VipPlanPayload])
+async def vip_plans(db: AsyncSession = Depends(get_db)):
+    return await get_vip_plans(db, include_disabled=True)
+
+
+@router.put("/vip/plans", response_model=list[VipPlanPayload])
+async def update_vip_plans(payload: VipPlanSettingsPayload, db: AsyncSession = Depends(get_db)):
+    return await save_vip_plans(db, payload.model_dump(mode="json"))
 
 
 @router.get("/users/{user_id}", response_model=AdminUserDetail)

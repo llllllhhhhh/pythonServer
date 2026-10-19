@@ -121,3 +121,48 @@ class ApiContractTests(unittest.IsolatedAsyncioTestCase):
 
         response = await self.client.get(f"/api/v1/support/conversations/{conversation.id}/messages")
         self.assertEqual(404, response.status_code)
+
+    async def test_admin_can_configure_vip_plans_used_by_public_checkout(self) -> None:
+        payload = {
+            "plans": [
+                {
+                    "id": 21,
+                    "name": "季度会员",
+                    "vip_type": "季度 VIP",
+                    "price": 29.9,
+                    "duration_days": 90,
+                    "note": "季度套餐",
+                    "badge": "推荐",
+                    "benefits": ["专属文章", "会员身份标识"],
+                    "enabled": True,
+                    "sort_order": 10,
+                },
+                {
+                    "id": 22,
+                    "name": "内部套餐",
+                    "vip_type": "内部 VIP",
+                    "price": 1,
+                    "duration_days": 1,
+                    "note": "不上架",
+                    "badge": "",
+                    "benefits": ["内部权益"],
+                    "enabled": False,
+                    "sort_order": 20,
+                },
+            ]
+        }
+        saved = await self.client.put("/api/v1/admin/vip/plans", json=payload)
+        self.assertEqual(200, saved.status_code)
+        self.assertEqual(2, len(saved.json()))
+
+        public = await self.client.get("/api/v1/public/vip/plans")
+        self.assertEqual(200, public.status_code)
+        self.assertEqual([21], [item["id"] for item in public.json()])
+        self.assertEqual(["专属文章", "会员身份标识"], public.json()[0]["benefits"])
+
+        order = await self.client.post(
+            "/api/v1/commerce/vip-orders",
+            json={"plan_id": 21, "payment_method": "wechat", "idempotency_key": "vip-plan-contract-21"},
+        )
+        self.assertEqual(201, order.status_code)
+        self.assertEqual("29.90", order.json()["payable_amount"])

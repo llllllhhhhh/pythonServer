@@ -173,7 +173,7 @@ class OrderService:
             if vip_user:
                 now = datetime.now()
                 for item in vip_items:
-                    plan = get_vip_plan(abs(int(item.product_id)))
+                    plan = await get_vip_plan(db, abs(int(item.product_id)), include_disabled=True)
                     if not plan:
                         continue
                     current_end = vip_user.vip_expires_at if vip_user.vip_enabled and vip_user.vip_expires_at and vip_user.vip_expires_at > now else now
