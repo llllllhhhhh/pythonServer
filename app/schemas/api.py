@@ -28,6 +28,7 @@ def validate_travel_date(value: str) -> str:
 
 class DecorationPayload(BaseModel):
     brand: dict[str, Any]
+    poster: dict[str, Any] = Field(default_factory=dict)
     pages: list[dict[str, Any]]
     bottomNav: list[dict[str, Any]] = Field(default_factory=list)
     routes: list[dict[str, Any]] = Field(default_factory=list)

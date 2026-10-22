@@ -1,4 +1,5 @@
 import hashlib
+import httpx
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -24,6 +25,22 @@ PUBLIC_CONFIG_KEY = "xuetuxing:decoration:published"
 MIN_ONBOARDING_VERSION = 3
 PUBLIC_IMAGE_CACHE_HEADERS = {"Cache-Control": "public, max-age=2592000, immutable"}
 PRIVATE_IMAGE_CACHE_HEADERS = {"Cache-Control": "private, no-store", "Pragma": "no-cache"}
+
+
+@router.get("/invite-qr")
+async def invite_qr(payload: str = Query(..., min_length=10, max_length=500)):
+    """Proxy invitation QR images through the platform domain for mini-program downloads."""
+    if not payload.startswith("XTXINVITE:"):
+        raise HTTPException(status_code=400, detail="Invalid invitation QR payload")
+    remote_url = "https://api.qrserver.com/v1/create-qr-code/"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            result = await client.get(remote_url, params={"size": "480x480", "margin": "10", "data": payload})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Invitation QR service unavailable") from exc
+    if result.status_code != 200 or not result.content:
+        raise HTTPException(status_code=502, detail="Invitation QR generation failed")
+    return Response(content=result.content, media_type=result.headers.get("content-type", "image/png"), headers={"Cache-Control": "private, max-age=300"})
 
 
 def image_response(content: bytes, content_type: str, cache_key: str, public: bool) -> Response:
