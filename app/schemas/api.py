@@ -571,6 +571,17 @@ class RegisterSubmitResponse(BaseModel):
     invitation_bound: bool = False
 
 
+class InviteBindPayload(BaseModel):
+    invite_code: str = Field(min_length=1, max_length=64)
+    device_id: str = Field(default="", max_length=160)
+
+
+class InviteBindResponse(BaseModel):
+    message: str
+    bound: bool = False
+    rewarded: bool = False
+
+
 class InviteRecordOut(BaseModel):
     nickname: str
     phone: str
@@ -598,6 +609,7 @@ class PointLedgerOut(BaseModel):
 class InviteDashboardOut(BaseModel):
     invite_code: str
     invite_payload: str
+    bound_inviter_code: str = ""
     points: int
     invite_score: int
     exchange_score: int

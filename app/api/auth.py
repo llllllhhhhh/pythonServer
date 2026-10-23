@@ -22,6 +22,8 @@ from app.services.point_service import PointService
 from app.schemas.api import (
     AuthResponse,
     InviteDashboardOut,
+    InviteBindPayload,
+    InviteBindResponse,
     InviteRecordOut,
     LoginPayload,
     RegisterPayload,
@@ -427,6 +429,9 @@ async def invite_dashboard(
             .order_by(InviteRelation.created_at.desc())
         )
     )
+    bound_inviter = await db.scalar(
+        select(InviteRelation).where(InviteRelation.invitee_phone == user.phone)
+    )
     phones = [item.invitee_phone for item in relations]
     invitees = {}
     if phones:
@@ -456,6 +461,7 @@ async def invite_dashboard(
     return InviteDashboardOut(
         invite_code=locked_user.user_no,
         invite_payload=f"XTXINVITE:{locked_user.user_no}",
+        bound_inviter_code=bound_inviter.inviter_id if bound_inviter else "",
         points=locked_user.points,
         invite_score=invite_score,
         exchange_score=exchange_score,
@@ -465,6 +471,85 @@ async def invite_dashboard(
         records=records,
         ledger=ledger,
     )
+
+
+@router.post("/invite/bind", response_model=InviteBindResponse)
+async def bind_invite(
+    payload: InviteBindPayload,
+    user: UserAccount = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    invite_code = payload.invite_code.strip()
+    if invite_code == user.user_no:
+        raise HTTPException(status_code=400, detail="不能绑定自己的邀请码")
+
+    inviter = await db.scalar(
+        select(UserAccount).where(
+            UserAccount.user_no == invite_code,
+            UserAccount.role == "user",
+            UserAccount.status == "active",
+            UserAccount.is_registered.is_(True),
+        )
+    )
+    if not inviter:
+        raise HTTPException(status_code=400, detail="邀请码无效或邀请人账号不可用")
+    if inviter.phone == user.phone:
+        raise HTTPException(status_code=400, detail="不能绑定自己的邀请码")
+
+    for account_id in sorted((user.id, inviter.id)):
+        await PointService.lock_user(db, account_id)
+
+    existing_relation = await db.scalar(
+        select(InviteRelation).where(InviteRelation.invitee_phone == user.phone)
+    )
+    if existing_relation:
+        if existing_relation.inviter_id == inviter.user_no:
+            return InviteBindResponse(
+                message="已经绑定该邀请码",
+                bound=True,
+                rewarded=bool(existing_relation.score_granted),
+            )
+        raise HTTPException(status_code=400, detail="该账号已经绑定其他邀请关系")
+
+    device_id = payload.device_id.strip() or "unknown"
+    reused_device = None
+    if device_id != "unknown":
+        reused_device = await db.scalar(
+            select(InviteRelation).where(InviteRelation.device_id == device_id)
+        )
+    relation = InviteRelation(
+        inviter_id=inviter.user_no,
+        invitee_phone=user.phone,
+        device_id=device_id,
+        score_granted=False,
+        abnormal=bool(reused_device),
+        frozen=False,
+    )
+    db.add(relation)
+    await db.flush()
+
+    rewarded = False
+    rule = await db.get(PointRule, 1)
+    invite_enabled = bool((rule.enabled and rule.invite_enabled) if rule else True)
+    invite_score = int(rule.invite_score if rule else 1)
+    if not relation.abnormal and invite_enabled and invite_score > 0:
+        valid_days = max(1, int(rule.valid_days if rule else 365))
+        await PointService.credit_locked(
+            db,
+            inviter,
+            invite_score,
+            biz_type="invite_reward",
+            biz_id=relation.id,
+            biz_no=str(relation.id),
+            idempotency_key=f"invite-reward:{relation.id}",
+            remark=f"已登录用户 {user.user_no} 绑定邀请关系",
+            expires_at=datetime.now() + timedelta(days=valid_days),
+        )
+        relation.score_granted = True
+        rewarded = True
+
+    await db.commit()
+    return InviteBindResponse(message="邀请码绑定成功", bound=True, rewarded=rewarded)
 
 
 @router.get("/admin/me", response_model=UserOut)
